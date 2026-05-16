@@ -88,6 +88,18 @@ app.get('/api/logs/:id', (req, res) => {
     }
 });
 
+app.delete('/api/logs/:id', (req, res) => {
+    const initialLength = scanSessions.length;
+    scanSessions = scanSessions.filter(s => s.sessionId !== req.params.id);
+    
+    if (scanSessions.length < initialLength) {
+        console.log(`[DELETE] Session ${req.params.id} removed by admin.`);
+        res.json({ success: true, message: "Session deleted" });
+    } else {
+        res.status(404).json({ success: false, message: "Session not found" });
+    }
+});
+
 app.post('/api/scan/result', (req, res) => {
     const data = req.body;
     
