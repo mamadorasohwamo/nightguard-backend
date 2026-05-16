@@ -10,9 +10,14 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/** Public admin list served by nightguard-web (e.g. Netlify): /admin.json */
-const PUBLIC_ADMIN_JSON_URL =
-    process.env.ADMIN_JSON_URL || 'https://nightguardac.netlify.app/admin.json';
+/** Admin list URLs — first success wins (must match deployed nightguard-web /admin.json) */
+const ADMIN_JSON_URL_CANDIDATES = [
+    process.env.ADMIN_JSON_URL,
+    'https://nightguardac.vercel.app/admin.json',
+    'https://nightguardac.netlify.app/admin.json',
+].filter(Boolean);
+
+let lastAdminFetchSource = '(none)';
 
 // Middleware
 app.use(cors());
@@ -35,25 +40,53 @@ let systemSettings = {
 };
 
 async function fetchAdmins() {
-    const url = PUBLIC_ADMIN_JSON_URL;
-    try {
-        const res = await fetch(url, { cache: 'no-store' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (!data || typeof data !== 'object') throw new Error('invalid JSON');
-        adminConfig = data;
-        console.log(
-            '[admin] Loaded public admin.json —',
-            (adminConfig.admins || []).length,
-            'entries from',
-            url
-        );
-    } catch (e) {
-        console.warn('[admin] Failed to fetch public admin.json:', e.message || e);
-        adminConfig = adminConfig && (adminConfig.admins || []).length
-            ? adminConfig
-            : { admins: [] };
+    const envIds = (process.env.ADMIN_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+    if (envIds.length) {
+        const fromEnv = envIds.map((discordId) => ({
+            discordId: String(discordId),
+            permissions: ['full'],
+            label: 'ENV ADMIN_DISCORD_IDS',
+        }));
+        adminConfig = { admins: fromEnv };
+        lastAdminFetchSource = 'ADMIN_DISCORD_IDS env';
+        console.log('[admin] Loaded', fromEnv.length, 'admin(s) from ADMIN_DISCORD_IDS');
+        return true;
     }
+
+    for (const url of ADMIN_JSON_URL_CANDIDATES) {
+        try {
+            const res = await fetch(url, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (!data || typeof data !== 'object' || !Array.isArray(data.admins)) {
+                throw new Error('invalid admin.json shape');
+            }
+            adminConfig = data;
+            lastAdminFetchSource = url;
+            console.log(
+                '[admin] Loaded admin.json —',
+                adminConfig.admins.length,
+                'entries from',
+                url
+            );
+            return true;
+        } catch (e) {
+            console.warn('[admin] Failed to fetch', url, '—', e.message || e);
+        }
+    }
+
+    if (!(adminConfig.admins || []).length) {
+        adminConfig = { admins: [] };
+        console.error(
+            '[admin] CRITICAL: No admins loaded. PIN generation will fail. ' +
+            'Deploy admin.json to Vercel or set ADMIN_JSON_URL / ADMIN_DISCORD_IDS on Railway.'
+        );
+    }
+    return (adminConfig.admins || []).length > 0;
 }
 
 function findAdmin(discordId) {
@@ -98,14 +131,30 @@ function canDeleteSession(viewerId, session) {
 app.get('/', (req, res) => res.send('NightGuard API Online v4'));
 
 // 1. PIN SYSTEM
-app.post('/api/pin/generate', (req, res) => {
+app.post('/api/pin/generate', async (req, res) => {
     try {
         const discordId = req.body?.discordId || req.headers['x-discord-id'];
-        if (!isRegisteredAdmin(discordId)) {
+        let authorized = isRegisteredAdmin(discordId);
+
+        if (!authorized && !(adminConfig.admins || []).length) {
+            await fetchAdmins();
+            authorized = isRegisteredAdmin(discordId);
+        }
+
+        if (!authorized) {
+            const knownIds = (adminConfig.admins || []).map((a) => String(a.discordId));
             return res.status(403).json({
                 success: false,
                 error: 'forbidden',
-                message: 'PIN generation requires an authorized admin account'
+                message: 'PIN generation requires an authorized admin account',
+                hint:
+                    'Backend admin list is loaded from your deployed admin.json. ' +
+                    'Ensure your Discord ID is in nightguard-web/public/admin.json on Vercel, ' +
+                    'or set ADMIN_DISCORD_IDS on Railway.',
+                yourDiscordId: discordId ? String(discordId) : null,
+                adminsLoaded: knownIds.length,
+                adminListSource: lastAdminFetchSource,
+                registeredIds: knownIds,
             });
         }
 
@@ -322,7 +371,8 @@ async function boot() {
     if (!Number.isNaN(refreshMs) && refreshMs >= 60000) {
         setInterval(fetchAdmins, refreshMs);
         console.log(
-            `[admin] Refreshing from ${PUBLIC_ADMIN_JSON_URL} every ${refreshMs / 1000}s`
+            `[admin] Refreshing admin list every ${refreshMs / 1000}s from`,
+            ADMIN_JSON_URL_CANDIDATES.join(' | ')
         );
     }
 
@@ -330,7 +380,8 @@ async function boot() {
         console.log(`=========================================`);
         console.log(`NightGuard AC Backend v4 - Online`);
         console.log(`Port: ${PORT}`);
-        console.log(`Admin list URL: ${PUBLIC_ADMIN_JSON_URL}`);
+        console.log(`Admin list URLs: ${ADMIN_JSON_URL_CANDIDATES.join(' -> ')}`);
+        console.log(`Admins loaded: ${(adminConfig.admins || []).length} (${lastAdminFetchSource})`);
         console.log(`=========================================`);
     });
 }
