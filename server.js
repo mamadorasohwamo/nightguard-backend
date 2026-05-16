@@ -1,6 +1,6 @@
 /**
  * NightGuard AC Backend API v4
- * Forensic log isolation, admin.json permissions, PIN ownership.
+ * Forensic log isolation, access.json roles (admin + customer), PIN ownership.
  */
 
 const express = require('express');
@@ -10,20 +10,22 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/** Admin list URLs — first success wins (must match deployed nightguard-web /admin.json) */
-const ADMIN_JSON_URL_CANDIDATES = [
+/** access.json URLs — admins + customers */
+const ACCESS_JSON_URL_CANDIDATES = [
+    process.env.ACCESS_JSON_URL,
     process.env.ADMIN_JSON_URL,
+    'https://nightguardac.vercel.app/access.json',
     'https://nightguardac.vercel.app/admin.json',
-    'https://nightguardac.netlify.app/admin.json',
+    'https://nightguardac.netlify.app/access.json',
 ].filter(Boolean);
 
-let lastAdminFetchSource = '(none)';
+let lastAccessFetchSource = '(none)';
 
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-let adminConfig = { admins: [] };
+let accessConfig = { admins: [], customers: [] };
 const pinOwners = new Map(); // pin string -> creator discord id
 
 let activePins = [];
@@ -39,73 +41,113 @@ let systemSettings = {
     pinExpiryMinutes: 60
 };
 
-async function fetchAdmins() {
-    const envIds = (process.env.ADMIN_DISCORD_IDS || '')
+async function fetchAccess() {
+    const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const envCustomers = (process.env.CUSTOMER_DISCORD_IDS || '')
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
 
-    if (envIds.length) {
-        const fromEnv = envIds.map((discordId) => ({
-            discordId: String(discordId),
-            permissions: ['full'],
-            label: 'ENV ADMIN_DISCORD_IDS',
-        }));
-        adminConfig = { admins: fromEnv };
-        lastAdminFetchSource = 'ADMIN_DISCORD_IDS env';
-        console.log('[admin] Loaded', fromEnv.length, 'admin(s) from ADMIN_DISCORD_IDS');
+    if (envAdmins.length || envCustomers.length) {
+        accessConfig = {
+            admins: envAdmins.map((discordId) => ({
+                discordId: String(discordId),
+                permissions: ['full'],
+                label: 'ENV ADMIN',
+            })),
+            customers: envCustomers.map((discordId) => ({
+                discordId: String(discordId),
+                label: 'ENV Customer',
+            })),
+        };
+        lastAccessFetchSource = 'ENV ids';
+        console.log(
+            '[access] ENV —',
+            accessConfig.admins.length,
+            'admin(s),',
+            accessConfig.customers.length,
+            'customer(s)'
+        );
         return true;
     }
 
-    for (const url of ADMIN_JSON_URL_CANDIDATES) {
+    for (const url of ACCESS_JSON_URL_CANDIDATES) {
         try {
             const res = await fetch(url, { cache: 'no-store' });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             if (!data || typeof data !== 'object' || !Array.isArray(data.admins)) {
-                throw new Error('invalid admin.json shape');
+                throw new Error('invalid access.json shape');
             }
-            adminConfig = data;
-            lastAdminFetchSource = url;
+            accessConfig = {
+                admins: data.admins || [],
+                customers: Array.isArray(data.customers) ? data.customers : [],
+            };
+            lastAccessFetchSource = url;
             console.log(
-                '[admin] Loaded admin.json —',
-                adminConfig.admins.length,
-                'entries from',
+                '[access] Loaded —',
+                accessConfig.admins.length,
+                'admin(s),',
+                accessConfig.customers.length,
+                'customer(s) from',
                 url
             );
             return true;
         } catch (e) {
-            console.warn('[admin] Failed to fetch', url, '—', e.message || e);
+            console.warn('[access] Failed to fetch', url, '—', e.message || e);
         }
     }
 
-    if (!(adminConfig.admins || []).length) {
-        adminConfig = { admins: [] };
-        console.error(
-            '[admin] CRITICAL: No admins loaded. PIN generation will fail. ' +
-            'Deploy admin.json to Vercel or set ADMIN_JSON_URL / ADMIN_DISCORD_IDS on Railway.'
-        );
-    }
-    return (adminConfig.admins || []).length > 0;
+    accessConfig = { admins: [], customers: [] };
+    console.error(
+        '[access] CRITICAL: No access list loaded. Deploy nightguard-web/public/access.json or set env IDs.'
+    );
+    return false;
 }
 
 function findAdmin(discordId) {
     if (discordId == null || discordId === '') return null;
     const id = String(discordId);
-    return (adminConfig.admins || []).find((a) => String(a.discordId) === id) || null;
+    return (accessConfig.admins || []).find((a) => String(a.discordId) === id) || null;
+}
+
+function findCustomer(discordId) {
+    if (discordId == null || discordId === '') return null;
+    const id = String(discordId);
+    return (accessConfig.customers || []).find((c) => String(c.discordId) === id) || null;
 }
 
 function hasEnvAdmin(id) {
-    const extra = (process.env.ADMIN_DISCORD_IDS || '')
+    return (process.env.ADMIN_DISCORD_IDS || '')
         .split(',')
         .map((s) => s.trim())
-        .filter(Boolean);
-    return extra.includes(String(id));
+        .includes(String(id));
 }
 
-/** Any permission listed in admin.json (generate PIN, see own logs) */
+function hasEnvCustomer(id) {
+    return (process.env.CUSTOMER_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .includes(String(id));
+}
+
+/** Admin or customer — may generate PIN and use dashboard */
+function isRegisteredUser(discordId) {
+    if (hasEnvAdmin(discordId) || hasEnvCustomer(discordId)) return true;
+    return !!findAdmin(discordId) || !!findCustomer(discordId);
+}
+
+/** Legacy name — admin panel list */
 function isRegisteredAdmin(discordId) {
-    return hasEnvAdmin(discordId) || !!findAdmin(discordId);
+    return isRegisteredUser(discordId);
+}
+
+function isCustomerOnly(discordId) {
+    if (hasEnvAdmin(discordId) || findAdmin(discordId)) return false;
+    return hasEnvCustomer(discordId) || !!findCustomer(discordId);
 }
 
 function hasFullPermission(discordId) {
@@ -134,26 +176,29 @@ app.get('/', (req, res) => res.send('NightGuard API Online v4'));
 app.post('/api/pin/generate', async (req, res) => {
     try {
         const discordId = req.body?.discordId || req.headers['x-discord-id'];
-        let authorized = isRegisteredAdmin(discordId);
+        let authorized = isRegisteredUser(discordId);
 
-        if (!authorized && !(adminConfig.admins || []).length) {
-            await fetchAdmins();
-            authorized = isRegisteredAdmin(discordId);
+        if (!authorized && !(accessConfig.admins || []).length && !(accessConfig.customers || []).length) {
+            await fetchAccess();
+            authorized = isRegisteredUser(discordId);
         }
 
         if (!authorized) {
-            const knownIds = (adminConfig.admins || []).map((a) => String(a.discordId));
+            const knownIds = [
+                ...(accessConfig.admins || []).map((a) => String(a.discordId)),
+                ...(accessConfig.customers || []).map((c) => String(c.discordId)),
+            ];
             return res.status(403).json({
                 success: false,
                 error: 'forbidden',
-                message: 'PIN generation requires an authorized admin account',
+                message: 'PIN generation requires an authorized admin or customer account',
                 hint:
-                    'Backend admin list is loaded from your deployed admin.json. ' +
-                    'Ensure your Discord ID is in nightguard-web/public/admin.json on Vercel, ' +
-                    'or set ADMIN_DISCORD_IDS on Railway.',
+                    'Add your Discord ID to nightguard-web/public/access.json (admins or customers) ' +
+                    'and redeploy Vercel, or set ADMIN_DISCORD_IDS / CUSTOMER_DISCORD_IDS on Railway.',
                 yourDiscordId: discordId ? String(discordId) : null,
-                adminsLoaded: knownIds.length,
-                adminListSource: lastAdminFetchSource,
+                adminsLoaded: (accessConfig.admins || []).length,
+                customersLoaded: (accessConfig.customers || []).length,
+                accessListSource: lastAccessFetchSource,
                 registeredIds: knownIds,
             });
         }
@@ -265,6 +310,17 @@ app.post('/api/scan/result', (req, res) => {
         dnsCacheHits: data.dnsCacheHits || [],
         explorerMemoryHits: data.explorerMemoryHits || [],
         injectionTraces: data.injectionTraces || [],
+        extendedForensicReport: data.extendedForensicReport || '',
+        usbForensicHits: data.usbForensicHits || [],
+        jumpListHits: data.jumpListHits || [],
+        deepForensicReport: data.deepForensicReport || '',
+        unsignedFilesCount: data.unsignedFilesCount || 0,
+        highEntropyCount: data.highEntropyCount || 0,
+        pcaForensicHits: data.pcaForensicHits || [],
+        entropyFindings: data.entropyFindings || [],
+        yaraFindings: data.yaraFindings || [],
+        unsignedFileFindings: data.unsignedFileFindings || [],
+        rpfIntegrityHits: data.rpfIntegrityHits || [],
         suspiciousFiles: data.suspiciousFiles || [],
         suspiciousDlls: data.suspiciousDlls || [],
         suspiciousArchives: data.suspiciousArchives || [],
@@ -313,16 +369,117 @@ app.post('/api/settings', (req, res) => {
     res.json({ success: true, settings: systemSettings });
 });
 
-// 4. Admin list — any registered admin (from public admin.json) may view; full perm still for settings
-app.get('/api/admin/admins', (req, res) => {
+// 4. Access roster — full admins only (admins + customers lists)
+app.get('/api/access/roster', (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
-    if (!isRegisteredAdmin(viewer)) {
-        return res.status(403).json({ success: false, error: 'forbidden' });
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden', message: 'Admins only' });
     }
-    res.json({ success: true, admins: adminConfig.admins || [] });
+    res.json({
+        success: true,
+        admins: accessConfig.admins || [],
+        customers: accessConfig.customers || [],
+    });
 });
 
-// 5. Bot — rotate admin.json
+/** @deprecated use /api/access/roster */
+app.get('/api/admin/admins', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    res.json({ success: true, admins: accessConfig.admins || [] });
+});
+
+// 5. Web dashboard — add/remove admin or customer (full permission)
+app.post('/api/access/manage', (req, res) => {
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
+    }
+
+    const { action, discordId, role, permissions, label } = req.body || {};
+    if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
+        return res.status(400).json({ success: false, error: 'invalid_discord_id' });
+    }
+    const listRole = role === 'customer' ? 'customer' : 'admin';
+    const id = String(discordId);
+
+    let admins = [...(accessConfig.admins || [])];
+    let customers = [...(accessConfig.customers || [])];
+
+    const removeFromBoth = () => {
+        const ai = admins.findIndex((a) => String(a.discordId) === id);
+        if (ai >= 0) admins.splice(ai, 1);
+        const ci = customers.findIndex((c) => String(c.discordId) === id);
+        if (ci >= 0) customers.splice(ci, 1);
+    };
+
+    if (action === 'remove') {
+        removeFromBoth();
+    } else if (action === 'add' || action === 'give') {
+        removeFromBoth();
+        if (listRole === 'customer') {
+            customers.push({
+                discordId: id,
+                label: label || 'NightGuard Customer',
+            });
+        } else {
+            const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+            admins.push({
+                discordId: id,
+                permissions: perms,
+                label: label || 'NightGuard Admin',
+            });
+        }
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add or remove' });
+    }
+
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
+    res.json({
+        success: true,
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'Applied in-memory. Commit nightguard-web/public/access.json and redeploy Vercel to persist.',
+    });
+});
+
+/** @deprecated — adds to admins list only */
+app.post('/api/admin/manage', (req, res) => {
+    req.body = { ...(req.body || {}), role: 'admin' };
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    const { action, discordId, permissions, label } = req.body || {};
+    if (!discordId) return res.status(400).json({ success: false, error: 'discordId required' });
+    const id = String(discordId);
+    let admins = [...(accessConfig.admins || [])];
+    let customers = (accessConfig.customers || []).filter((c) => String(c.discordId) !== id);
+    const idx = admins.findIndex((a) => String(a.discordId) === id);
+    if (action === 'remove') {
+        if (idx >= 0) admins.splice(idx, 1);
+    } else if (action === 'add' || action === 'give') {
+        const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+        const entry = { discordId: id, permissions: perms, label: label || 'NightGuard Admin' };
+        if (idx >= 0) admins[idx] = { ...admins[idx], ...entry };
+        else admins.push(entry);
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add or remove' });
+    }
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
+    res.json({
+        success: true,
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'Applied in-memory. Commit access.json and redeploy Vercel.',
+    });
+});
+
+// 6. Bot — rotate access.json
 app.post('/api/bot/permission', (req, res) => {
     const secret = process.env.BOT_SECRET || 'change-me-in-production';
     const auth = req.headers.authorization || '';
@@ -337,28 +494,28 @@ app.post('/api/bot/permission', (req, res) => {
     }
 
     const id = String(discordId);
-    const admins = adminConfig.admins || [];
+    let admins = [...(accessConfig.admins || [])];
+    let customers = (accessConfig.customers || []).filter((c) => String(c.discordId) !== id);
     const idx = admins.findIndex((a) => String(a.discordId) === id);
 
     if (action === 'remove') {
         if (idx >= 0) admins.splice(idx, 1);
     } else if (action === 'add' || action === 'give') {
-        const perms = Array.isArray(permissions) && permissions.length
-            ? permissions
-            : ['full'];
+        const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
         if (idx >= 0) admins[idx].permissions = perms;
-        else admins.push({ discordId: id, permissions: perms });
+        else admins.push({ discordId: id, permissions: perms, label: 'Bot Admin' });
     } else {
         return res.status(400).json({ success: false, error: 'action must be add|give|remove' });
     }
 
-    adminConfig.admins = admins;
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
 
     res.json({
         success: true,
-        admins: adminConfig.admins,
-        note:
-            'In-memory update applied. To persist and survive backend restarts, edit nightguard-web/public/admin.json, deploy your static site, and wait for the next refresh (or set ADMIN_JSON_REFRESH_MS).'
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'In-memory update. Persist via nightguard-web/public/access.json on Vercel.',
     });
 });
 
@@ -368,15 +525,15 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 async function boot() {
-    await fetchAdmins();
+    await fetchAccess();
 
-    const refreshRaw = process.env.ADMIN_JSON_REFRESH_MS;
+    const refreshRaw = process.env.ACCESS_JSON_REFRESH_MS || process.env.ADMIN_JSON_REFRESH_MS;
     const refreshMs = refreshRaw ? parseInt(refreshRaw, 10) : 900000;
     if (!Number.isNaN(refreshMs) && refreshMs >= 60000) {
-        setInterval(fetchAdmins, refreshMs);
+        setInterval(fetchAccess, refreshMs);
         console.log(
-            `[admin] Refreshing admin list every ${refreshMs / 1000}s from`,
-            ADMIN_JSON_URL_CANDIDATES.join(' | ')
+            `[access] Refreshing every ${refreshMs / 1000}s from`,
+            ACCESS_JSON_URL_CANDIDATES.join(' | ')
         );
     }
 
@@ -384,8 +541,11 @@ async function boot() {
         console.log(`=========================================`);
         console.log(`NightGuard AC Backend v4 - Online`);
         console.log(`Port: ${PORT}`);
-        console.log(`Admin list URLs: ${ADMIN_JSON_URL_CANDIDATES.join(' -> ')}`);
-        console.log(`Admins loaded: ${(adminConfig.admins || []).length} (${lastAdminFetchSource})`);
+        console.log(`Access URLs: ${ACCESS_JSON_URL_CANDIDATES.join(' -> ')}`);
+        console.log(
+            `Loaded: ${(accessConfig.admins || []).length} admin(s), ` +
+            `${(accessConfig.customers || []).length} customer(s) (${lastAccessFetchSource})`
+        );
         console.log(`=========================================`);
     });
 }
