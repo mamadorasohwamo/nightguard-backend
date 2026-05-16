@@ -1,6 +1,6 @@
 /**
- * NightGuard AC Backend API v3
- * Professional Anti-Cheat Management Server
+ * NightGuard AC Backend API v4
+ * Forensic log isolation, admin.json permissions, PIN ownership.
  */
 
 const express = require('express');
@@ -10,11 +10,17 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+/** Public admin list served by nightguard-web (e.g. Netlify): /admin.json */
+const PUBLIC_ADMIN_JSON_URL =
+    process.env.ADMIN_JSON_URL || 'https://nightguardac.netlify.app/admin.json';
+
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Allow large scan results
+app.use(express.json({ limit: '50mb' }));
 
-// In-Memory Storage (Use Database like MongoDB/PostgreSQL for production persistence)
+let adminConfig = { admins: [] };
+const pinOwners = new Map(); // pin string -> creator discord id
+
 let activePins = [];
 let scanSessions = [];
 let systemSettings = {
@@ -28,139 +34,301 @@ let systemSettings = {
     pinExpiryMinutes: 60
 };
 
+async function fetchAdmins() {
+    const url = PUBLIC_ADMIN_JSON_URL;
+    try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data || typeof data !== 'object') throw new Error('invalid JSON');
+        adminConfig = data;
+        console.log(
+            '[admin] Loaded public admin.json —',
+            (adminConfig.admins || []).length,
+            'entries from',
+            url
+        );
+    } catch (e) {
+        console.warn('[admin] Failed to fetch public admin.json:', e.message || e);
+        adminConfig = adminConfig && (adminConfig.admins || []).length
+            ? adminConfig
+            : { admins: [] };
+    }
+}
+
+function findAdmin(discordId) {
+    if (discordId == null || discordId === '') return null;
+    const id = String(discordId);
+    return (adminConfig.admins || []).find((a) => String(a.discordId) === id) || null;
+}
+
+function hasEnvAdmin(id) {
+    const extra = (process.env.ADMIN_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    return extra.includes(String(id));
+}
+
+/** Any permission listed in admin.json (generate PIN, see own logs) */
+function isRegisteredAdmin(discordId) {
+    return hasEnvAdmin(discordId) || !!findAdmin(discordId);
+}
+
+function hasFullPermission(discordId) {
+    if (hasEnvAdmin(discordId)) return true;
+    const a = findAdmin(discordId);
+    if (!a) return false;
+    return (a.permissions || []).includes('full');
+}
+
+function canViewSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
+    return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
+}
+
+function canDeleteSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
+    if (!isRegisteredAdmin(viewerId)) return false;
+    return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
+}
+
 // --- API ROUTES ---
 
-// Health Check
-app.get('/', (req, res) => res.send("NightGuard API Online v3"));
+app.get('/', (req, res) => res.send('NightGuard API Online v4'));
 
 // 1. PIN SYSTEM
 app.post('/api/pin/generate', (req, res) => {
     try {
+        const discordId = req.body?.discordId || req.headers['x-discord-id'];
+        if (!isRegisteredAdmin(discordId)) {
+            return res.status(403).json({
+                success: false,
+                error: 'forbidden',
+                message: 'PIN generation requires an authorized admin account'
+            });
+        }
+
         const rawUuid = uuidv4();
         const pin = `NG-${rawUuid.split('-')[0].toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         activePins.push({
-            pin: pin,
+            pin,
             hwid: null,
+            ownerDiscordId: String(discordId),
             createdAt: Date.now(),
-            expiresAt: Date.now() + (systemSettings.pinExpiryMinutes * 60 * 1000),
+            expiresAt: Date.now() + systemSettings.pinExpiryMinutes * 60 * 1000,
             used: false
         });
+        pinOwners.set(pin, String(discordId));
 
-        console.log(`[PIN] Generated: ${pin}`);
-        res.json({ success: true, pin: pin });
+        console.log(`[PIN] Generated: ${pin} for admin ${discordId}`);
+        res.json({ success: true, pin, ownerDiscordId: String(discordId) });
     } catch (error) {
-        res.status(500).json({ success: false, message: "Generation failed" });
+        res.status(500).json({ success: false, message: 'Generation failed' });
     }
 });
 
 app.post('/api/pin/validate', (req, res) => {
     const { pin, hwid } = req.body;
-    const foundPin = activePins.find(p => p.pin === pin);
+    const foundPin = activePins.find((p) => p.pin === pin);
 
-    if (!foundPin) return res.status(401).json({ success: false, error: "invalid_pin" });
-    if (Date.now() > foundPin.expiresAt) return res.status(401).json({ success: false, error: "expired_pin" });
-    if (foundPin.used) return res.status(403).json({ success: false, error: "used_pin" });
+    if (!foundPin) return res.status(401).json({ success: false, error: 'invalid_pin' });
+    if (Date.now() > foundPin.expiresAt) return res.status(401).json({ success: false, error: 'expired_pin' });
+    if (foundPin.used) return res.status(403).json({ success: false, error: 'used_pin' });
 
-    // HWID Binding
     if (!foundPin.hwid) {
         foundPin.hwid = hwid;
     } else if (foundPin.hwid !== hwid) {
-        return res.status(403).json({ success: false, error: "hwid_mismatch" });
+        return res.status(403).json({ success: false, error: 'hwid_mismatch' });
     }
 
     foundPin.used = true;
-    console.log(`[VERIFY] PIN ${pin} validated for HWID ${hwid}`);
-    res.json({ success: true, status: "verified" });
+    const owner = foundPin.ownerDiscordId || pinOwners.get(pin);
+    if (owner) pinOwners.set(pin, String(owner));
+
+    console.log(`[VERIFY] PIN ${pin} validated for HWID ${hwid} (owner ${owner || 'n/a'})`);
+    res.json({ success: true, status: 'verified' });
 });
 
 // 2. LOG SYSTEM
 app.get('/api/logs', (req, res) => {
-    res.json({ success: true, logs: scanSessions });
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    let list = scanSessions;
+    if (!hasFullPermission(viewer)) {
+        list = scanSessions.filter((s) => canViewSession(viewer, s));
+    }
+    res.json({ success: true, logs: list });
 });
 
 app.get('/api/logs/:id', (req, res) => {
-    const session = scanSessions.find(s => s.sessionId === req.params.id);
-    if (session) {
-        res.json({ success: true, session });
-    } else {
-        res.status(404).json({ success: false, message: "Session not found" });
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    const session = scanSessions.find((s) => s.sessionId === req.params.id);
+    if (!session) {
+        return res.status(404).json({ success: false, message: 'Session not found' });
     }
+    if (!canViewSession(viewer, session)) {
+        return res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+    res.json({ success: true, session });
 });
 
 app.delete('/api/logs/:id', (req, res) => {
-    const initialLength = scanSessions.length;
-    scanSessions = scanSessions.filter(s => s.sessionId !== req.params.id);
-    
-    if (scanSessions.length < initialLength) {
-        console.log(`[DELETE] Session ${req.params.id} removed by admin.`);
-        res.json({ success: true, message: "Session deleted" });
-    } else {
-        res.status(404).json({ success: false, message: "Session not found" });
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    const session = scanSessions.find((s) => s.sessionId === req.params.id);
+    if (!session) {
+        return res.status(404).json({ success: false, message: 'Session not found' });
     }
+    if (!canDeleteSession(viewer, session)) {
+        return res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+    scanSessions = scanSessions.filter((s) => s.sessionId !== req.params.id);
+    console.log(`[DELETE] Session ${req.params.id} removed (by ${viewer}).`);
+    res.json({ success: true, message: 'Session deleted' });
 });
 
 app.post('/api/scan/result', (req, res) => {
-    const data = req.body;
-    
+    const data = req.body || {};
+    const pin = data.pin || '';
+    const ownerFromPin = pinOwners.get(pin) || data.pinOwnerDiscordId || null;
+
     const newSession = {
         sessionId: uuidv4().slice(0, 12).toUpperCase(),
-        pin: data.pin || 'N/A',
+        pin: pin || 'N/A',
+        pinOwnerDiscordId: ownerFromPin || 'unknown',
         discordId: data.discordId || 'N/A',
         discordUsername: data.discordUsername || 'Guest',
         pcName: data.pcName || 'Unknown PC',
         hwid: data.hwid || 'N/A',
         scanTime: new Date(),
         riskLevel: data.riskLevel || 0,
-        detections: data.detections || [], // Full detection list
+        detections: data.detections || [],
         browserFindings: data.browserFindings || [],
         discordFindings: data.discordFindings || [],
         suspiciousFiles: data.suspiciousFiles || [],
         suspiciousDlls: data.suspiciousDlls || [],
         suspiciousArchives: data.suspiciousArchives || [],
         registryChanges: data.registryChanges || [],
-        status: (data.riskLevel > 50) ? "FLAGGED" : "SECURE"
+        status: (data.riskLevel > 50) ? 'FLAGGED' : 'SECURE'
     };
 
     scanSessions.unshift(newSession);
-    if (scanSessions.length > 1000) scanSessions.pop(); // Keep last 1000
+    if (scanSessions.length > 1000) scanSessions.pop();
 
-    console.log(`[SCAN] Result received from ${newSession.pcName} (Risk: ${newSession.riskLevel}%)`);
+    console.log(
+        `[SCAN] ${newSession.pcName} risk=${newSession.riskLevel}% owner=${newSession.pinOwnerDiscordId}`
+    );
     res.json({ success: true, sessionId: newSession.sessionId });
 });
 
-// 3. SYSTEM STATS & SETTINGS
+// 3. STATS & SETTINGS
 app.get('/api/stats', (req, res) => {
     res.json({
         success: true,
         stats: {
             totalScans: scanSessions.length,
-            flaggedScans: scanSessions.filter(s => s.status === "FLAGGED").length,
-            uniqueUsers: new Set(scanSessions.map(s => s.hwid)).size,
-            activePins: activePins.filter(p => !p.used && p.expiresAt > Date.now()).length,
+            flaggedScans: scanSessions.filter((s) => s.status === 'FLAGGED').length,
+            uniqueUsers: new Set(scanSessions.map((s) => s.hwid)).size,
+            activePins: activePins.filter((p) => !p.used && p.expiresAt > Date.now()).length,
             uptime: process.uptime()
         }
     });
 });
 
-app.get('/api/settings', (req, res) => res.json(systemSettings));
+app.get('/api/settings', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    res.json(systemSettings);
+});
+
 app.post('/api/settings', (req, res) => {
-    systemSettings = { ...systemSettings, ...req.body };
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    const { viewerDiscordId, ...rest } = req.body || {};
+    systemSettings = { ...systemSettings, ...rest };
     res.json({ success: true, settings: systemSettings });
 });
 
-// --- HELPERS ---
+// 4. Admin list — any registered admin (from public admin.json) may view; full perm still for settings
+app.get('/api/admin/admins', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!isRegisteredAdmin(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    res.json({ success: true, admins: adminConfig.admins || [] });
+});
 
-// Auto Cleanup Expired PINs every 10 mins
+// 5. Bot — rotate admin.json
+app.post('/api/bot/permission', (req, res) => {
+    const secret = process.env.BOT_SECRET || 'change-me-in-production';
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (token !== secret) {
+        return res.status(401).json({ success: false, error: 'unauthorized' });
+    }
+
+    const { action, discordId, permissions } = req.body || {};
+    if (!discordId) {
+        return res.status(400).json({ success: false, error: 'discordId required' });
+    }
+
+    const id = String(discordId);
+    const admins = adminConfig.admins || [];
+    const idx = admins.findIndex((a) => String(a.discordId) === id);
+
+    if (action === 'remove') {
+        if (idx >= 0) admins.splice(idx, 1);
+    } else if (action === 'add' || action === 'give') {
+        const perms = Array.isArray(permissions) && permissions.length
+            ? permissions
+            : ['full'];
+        if (idx >= 0) admins[idx].permissions = perms;
+        else admins.push({ discordId: id, permissions: perms });
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add|give|remove' });
+    }
+
+    adminConfig.admins = admins;
+
+    res.json({
+        success: true,
+        admins: adminConfig.admins,
+        note:
+            'In-memory update applied. To persist and survive backend restarts, edit nightguard-web/public/admin.json, deploy your static site, and wait for the next refresh (or set ADMIN_JSON_REFRESH_MS).'
+    });
+});
+
 setInterval(() => {
     const now = Date.now();
-    activePins = activePins.filter(p => p.expiresAt > now || !p.used);
+    activePins = activePins.filter((p) => p.expiresAt > now || !p.used);
 }, 10 * 60 * 1000);
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`=========================================`);
-    console.log(`NightGuard AC Backend v3 - Online`);
-    console.log(`Port: ${PORT}`);
-    console.log(`=========================================`);
+async function boot() {
+    await fetchAdmins();
+
+    const refreshRaw = process.env.ADMIN_JSON_REFRESH_MS;
+    const refreshMs = refreshRaw ? parseInt(refreshRaw, 10) : 900000;
+    if (!Number.isNaN(refreshMs) && refreshMs >= 60000) {
+        setInterval(fetchAdmins, refreshMs);
+        console.log(
+            `[admin] Refreshing from ${PUBLIC_ADMIN_JSON_URL} every ${refreshMs / 1000}s`
+        );
+    }
+
+    app.listen(PORT, () => {
+        console.log(`=========================================`);
+        console.log(`NightGuard AC Backend v4 - Online`);
+        console.log(`Port: ${PORT}`);
+        console.log(`Admin list URL: ${PUBLIC_ADMIN_JSON_URL}`);
+        console.log(`=========================================`);
+    });
+}
+
+boot().catch((err) => {
+    console.error(err);
+    process.exit(1);
 });
