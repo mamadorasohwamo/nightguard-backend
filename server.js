@@ -16,10 +16,6 @@ app.use(cors());
 // Support JSON payloads
 app.use(express.json());
 
-// Temporary in-memory storage for PINs and Logs
-let activePins = [];
-let scanLogs = [];
-
 /**
  * Route: GET /
  * Simple health check
@@ -111,35 +107,100 @@ app.post('/verify-pin', (req, res) => {
     });
 });
 
+// Temporary in-memory storage
+let activePins = [];
+let scanSessions = []; // Professional session storage
+let systemSettings = {
+    realTimeScan: true,
+    browserMonitoring: true,
+    discordMonitoring: true,
+    archiveScanning: true,
+    telemetry: true,
+    autoBan: false
+};
+
 /**
  * Route: POST /logs
- * Receives scan logs from C++ client or frontend
+ * Receives complete scan sessions from C++ client
  */
 app.post('/logs', (req, res) => {
-    const { pin, type, message, pc_name } = req.body;
+    const sessionData = req.body;
     
-    const logEntry = {
-        id: uuidv4().slice(0, 8),
-        pin,
-        type: type || 'info',
-        message,
-        pc_name: pc_name || 'Unknown',
-        timestamp: new Date()
+    // Create professional session object
+    const newSession = {
+        sessionId: uuidv4().slice(0, 12).toUpperCase(),
+        pin: sessionData.pin || 'N/A',
+        discordId: sessionData.discordId || 'Unknown',
+        discordUsername: sessionData.discordUsername || 'Guest',
+        pcName: sessionData.pcName || 'Unknown PC',
+        hwid: sessionData.hwid || 'N/A',
+        scanTime: new Date(),
+        riskLevel: sessionData.riskLevel || 0, // 0 to 100
+        detections: sessionData.detections || [],
+        browserFindings: sessionData.browserFindings || [],
+        discordFindings: sessionData.discordFindings || [],
+        suspiciousFiles: sessionData.suspiciousFiles || [],
+        suspiciousDlls: sessionData.suspiciousDlls || [],
+        suspiciousArchives: sessionData.suspiciousArchives || [],
+        registryChanges: sessionData.registryChanges || []
     };
 
-    scanLogs.unshift(logEntry); // Newest first
-    if (scanLogs.length > 100) scanLogs.pop(); // Keep last 100
+    scanSessions.unshift(newSession);
+    if (scanSessions.length > 500) scanSessions.pop();
 
-    console.log(`[LOG] ${pc_name || 'System'}: ${message}`);
-    res.json({ success: true });
+    console.log(`[SCAN] Session ${newSession.sessionId} received from ${newSession.pcName}. Risk: ${newSession.riskLevel}%`);
+    res.json({ success: true, sessionId: newSession.sessionId });
 });
 
 /**
  * Route: GET /fetch-logs
- * Returns all logs for dashboard
+ * Returns all sessions for dashboard
  */
 app.get('/fetch-logs', (req, res) => {
-    res.json({ success: true, logs: scanLogs });
+    res.json({ success: true, logs: scanSessions });
+});
+
+/**
+ * Route: GET /logs/:id
+ * Returns specific session details
+ */
+app.get('/logs/:id', (req, res) => {
+    const session = scanSessions.find(s => s.sessionId === req.params.id);
+    if (session) {
+        res.json({ success: true, session });
+    } else {
+        res.status(404).json({ success: false, message: "Session not found" });
+    }
+});
+
+/**
+ * Route: GET /stats
+ * Returns system statistics
+ */
+app.get('/stats', (req, res) => {
+    const totalScans = scanSessions.length;
+    const flaggedScans = scanSessions.filter(s => s.riskLevel > 50).length;
+    const uniqueUsers = new Set(scanSessions.map(s => s.hwid)).size;
+
+    res.json({
+        success: true,
+        stats: {
+            totalScans,
+            flaggedScans,
+            uniqueUsers,
+            activePins: activePins.length,
+            uptime: process.uptime()
+        }
+    });
+});
+
+/**
+ * Route: GET/POST /settings
+ */
+app.get('/settings', (req, res) => res.json(systemSettings));
+app.post('/settings', (req, res) => {
+    systemSettings = { ...systemSettings, ...req.body };
+    res.json({ success: true, settings: systemSettings });
 });
 
 /**
