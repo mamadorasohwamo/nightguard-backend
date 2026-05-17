@@ -186,6 +186,34 @@ app.get('/api/customer/scans', authenticateToken, (req, res) => {
     res.json(customerScans);
 });
 
+// 4.1. Single Scan Details
+app.get('/api/scan/:sessionId', authenticateToken, (req, res) => {
+    const scan = storage.scans.find(s => s.session_id === req.params.sessionId);
+    if (!scan) return res.status(404).json({ success: false, error: 'Scan not found' });
+    
+    // Authorization: Must be owner or admin
+    if (scan.customer_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const detections = storage.detections.filter(d => d.scan_id === scan.id);
+    res.json({ success: true, scan, detections });
+});
+
+// 4.2. Delete Scan
+app.delete('/api/scan/:sessionId', authenticateToken, (req, res) => {
+    const scanIndex = storage.scans.findIndex(s => s.session_id === req.params.sessionId);
+    if (scanIndex === -1) return res.status(404).json({ success: false, error: 'Scan not found' });
+    
+    const scan = storage.scans[scanIndex];
+    if (scan.customer_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    storage.scans.splice(scanIndex, 1);
+    res.json({ success: true, message: 'Scan deleted' });
+});
+
 // 5. Admin Dashboard (Global)
 app.get('/api/admin/inspection-logs', authenticateToken, isAdmin, (req, res) => {
     const logs = storage.customers.map(c => {
@@ -214,6 +242,25 @@ app.get('/api/admin/customer/:id/scans', authenticateToken, isAdmin, (req, res) 
         .filter(s => s.customer_id === customerId)
         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json(customerScans);
+});
+
+// 6. Access Management
+app.get('/api/access/roster', authenticateToken, isAdmin, (req, res) => {
+    res.json({ success: true, customers: storage.customers });
+});
+
+app.post('/api/access/manage', authenticateToken, isAdmin, (req, res) => {
+    const { action, discordId, role } = req.body;
+    
+    if (action === 'update_role') {
+        const user = storage.customers.find(c => c.discord_id === discordId);
+        if (user) {
+            user.role = role;
+            return res.json({ success: true, message: `Role updated to ${role}` });
+        }
+    }
+    
+    res.status(400).json({ success: false, error: 'Invalid action or user not found' });
 });
 
 // --- ERROR HANDLING ---
