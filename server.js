@@ -308,10 +308,21 @@ app.post('/api/pin/validate', (req, res) => {
 // 2. LOG SYSTEM
 app.get('/api/logs', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!viewer) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
     let list = scanSessions;
+    
+    // If not a full admin, only show logs where this user is the owner of the PIN
     if (!await hasFullPermission(viewer)) {
-        list = scanSessions.filter((s) => (s.pinOwnerDiscordId === String(viewer)));
+        list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(viewer));
+    } else {
+        // Admin view: optionally filter by target customer if provided
+        const targetCustomer = req.query.targetCustomer;
+        if (targetCustomer) {
+            list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(targetCustomer));
+        }
     }
+    
     res.json({ success: true, logs: list });
 });
 
@@ -412,7 +423,6 @@ app.get('/api/stats', (req, res) => {
     });
 });
 
-// 4. ADMIN INSPECTION LOGS - CUSTOMER OVERVIEW
 app.get('/api/admin/customer-stats', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
     if (!await hasFullPermission(viewer)) {
@@ -420,32 +430,46 @@ app.get('/api/admin/customer-stats', async (req, res) => {
     }
 
     const customerMap = new Map();
-
-    // Group scans by owner
-    scanSessions.forEach(session => {
-        const ownerId = session.pinOwnerDiscordId || 'unknown';
+    
+    // Aggregate data for admins to see who scanned what
+    scanSessions.forEach(s => {
+        const ownerId = s.pinOwnerDiscordId || 'Unknown';
         if (!customerMap.has(ownerId)) {
-            customerMap.set(ownerId, {
-                discordId: ownerId,
-                totalScans: 0,
-                totalDetections: 0,
-                latestScan: null,
-                riskScoreSum: 0
+            customerMap.set(ownerId, { 
+                discordId: ownerId, 
+                scanCount: 0, 
+                detections: 0,
+                lastActive: s.scanTime 
             });
         }
-        const data = customerMap.get(ownerId);
-        data.totalScans++;
-        data.totalDetections += (session.detections?.length || 0);
-        
-        const scanDate = new Date(session.scanTime);
-        if (!data.latestScan || scanDate > new Date(data.latestScan)) {
-            data.latestScan = session.scanTime;
-        }
-        data.riskScoreSum += (session.riskLevel || 0);
+        const stats = customerMap.get(ownerId);
+        stats.scanCount++;
+        if (s.detections && s.detections.length > 0) stats.detections++;
+        if (new Date(s.scanTime) > new Date(stats.lastActive)) stats.lastActive = s.scanTime;
     });
 
-    const result = Array.from(customerMap.values());
-    res.json({ success: true, customers: result });
+    res.json({ success: true, customers: Array.from(customerMap.values()) });
+});
+
+app.get('/api/dashboard/stats', async (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!viewer) return res.status(401).json({ success: false });
+
+    const isFullAdmin = await hasFullPermission(viewer);
+    
+    // Isolation logic for dashboard counters
+    const userScans = isFullAdmin 
+        ? scanSessions 
+        : scanSessions.filter(s => String(s.pinOwnerDiscordId) === String(viewer));
+
+    const stats = {
+        totalScans: userScans.length,
+        activePins: activePins.filter(p => isFullAdmin || String(p.ownerDiscordId) === String(viewer)).length,
+        detections: userScans.filter(s => s.detections && s.detections.length > 0).length,
+        systemStatus: "Healthy"
+    };
+
+    res.json({ success: true, stats });
 });
 
 app.get('/api/settings', async (req, res) => {
