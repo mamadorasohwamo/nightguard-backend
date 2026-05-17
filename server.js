@@ -475,11 +475,82 @@ app.post('/api/admin/manage', (req, res) => {
         success: true,
         admins: accessConfig.admins,
         customers: accessConfig.customers,
-        note: 'Applied in-memory. Commit access.json and redeploy Vercel to persist.',
+        note: 'Applied in-memory. Commit access.json and redeploy Vercel.',
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`NightGuard API (v4) listening on port ${PORT}`);
-    fetchAccess();
+// 6. Bot — rotate access.json
+app.post('/api/bot/permission', (req, res) => {
+    const secret = process.env.BOT_SECRET || 'change-me-in-production';
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (token !== secret) {
+        return res.status(401).json({ success: false, error: 'unauthorized' });
+    }
+
+    const { action, discordId, permissions } = req.body || {};
+    if (!discordId) {
+        return res.status(400).json({ success: false, error: 'discordId required' });
+    }
+
+    const id = String(discordId);
+    let admins = [...(accessConfig.admins || [])];
+    let customers = (accessConfig.customers || []).filter((c) => String(c.discordId) !== id);
+    const idx = admins.findIndex((a) => String(a.discordId) === id);
+
+    if (action === 'remove') {
+        if (idx >= 0) admins.splice(idx, 1);
+    } else if (action === 'add' || action === 'give') {
+        const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+        if (idx >= 0) admins[idx].permissions = perms;
+        else admins.push({ discordId: id, permissions: perms, label: 'Bot Admin' });
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add|give|remove' });
+    }
+
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
+
+    res.json({
+        success: true,
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'In-memory update. Persist via nightguard-web/public/access.json on Vercel.',
+    });
+});
+
+setInterval(() => {
+    const now = Date.now();
+    activePins = activePins.filter((p) => p.expiresAt > now || !p.used);
+}, 10 * 60 * 1000);
+
+async function boot() {
+    await fetchAccess();
+
+    const refreshRaw = process.env.ACCESS_JSON_REFRESH_MS || process.env.ADMIN_JSON_REFRESH_MS;
+    const refreshMs = refreshRaw ? parseInt(refreshRaw, 10) : 900000;
+    if (!Number.isNaN(refreshMs) && refreshMs >= 60000) {
+        setInterval(fetchAccess, refreshMs);
+        console.log(
+            `[access] Refreshing every ${refreshMs / 1000}s from`,
+            ACCESS_JSON_URL_CANDIDATES.join(' | ')
+        );
+    }
+
+    app.listen(PORT, () => {
+        console.log(`=========================================`);
+        console.log(`NightGuard AC Backend v4 - Online`);
+        console.log(`Port: ${PORT}`);
+        console.log(`Access URLs: ${ACCESS_JSON_URL_CANDIDATES.join(' -> ')}`);
+        console.log(
+            `Loaded: ${(accessConfig.admins || []).length} admin(s), ` +
+            `${(accessConfig.customers || []).length} customer(s) (${lastAccessFetchSource})`
+        );
+        console.log(`=========================================`);
+    });
+}
+
+boot().catch((err) => {
+    console.error(err);
+    process.exit(1);
 });
