@@ -96,8 +96,9 @@ app.post('/api/scan/upload', (req, res) => {
                 // Store detections if any
                 if (data.detections && Array.isArray(data.detections)) {
                     data.detections.forEach(det => {
-                        db.run('INSERT INTO detections (scan_id, category, path, matched_keyword, severity, confidence_score) VALUES (?, ?, ?, ?, ?, ?)',
-                            [scanId, det.category, det.path, det.match, det.severity, det.score / 100.0]);
+                        const sources = Array.isArray(det.evidenceSources) ? det.evidenceSources.join(', ') : '';
+                        db.run('INSERT INTO detections (scan_id, category, path, matched_keyword, severity, activity_time, downloaded_at, executed_at, first_seen, deleted_at, confidence_score, evidence_sources) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                            [scanId, det.category, det.path, det.match, det.severity, det.activityTime, det.downloadedAt, det.executedAt, det.firstSeen, det.deletedAt, det.confidenceScore, sources]);
                     });
                 }
 

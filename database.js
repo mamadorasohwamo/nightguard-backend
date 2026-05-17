@@ -50,12 +50,13 @@ const initDb = () => {
             path TEXT,
             matched_keyword TEXT,
             severity TEXT,
-            first_seen DATETIME,
+            activity_time DATETIME,
             downloaded_at DATETIME,
             executed_at DATETIME,
-            last_seen DATETIME,
+            first_seen DATETIME,
             deleted_at DATETIME,
             confidence_score REAL,
+            evidence_sources TEXT,
             FOREIGN KEY(scan_id) REFERENCES scans(id)
         )`);
 
