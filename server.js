@@ -123,17 +123,18 @@ async function fetchAccess() {
     // 1. Try Loading from Database (Primary)
     try {
         if (mongoose.connection.readyState === 1) {
-            const dbUsers = await User.find({});
-            if (dbUsers.length > 0) {
+            // Added timeout to prevent fetchAccess from hanging the boot/refresh cycle
+            const dbUsers = await User.find({}).maxTimeMS(5000);
+            if (dbUsers && dbUsers.length > 0) {
                 accessConfig = {
                     admins: dbUsers.filter(u => u.role === 'admin').map(u => ({
                         discordId: u.discordId,
-                        permissions: u.permissions,
-                        label: u.label
+                        permissions: u.permissions || ['full'],
+                        label: u.label || 'Admin'
                     })),
                     customers: dbUsers.filter(u => u.role === 'customer').map(u => ({
                         discordId: u.discordId,
-                        label: u.label
+                        label: u.label || 'Customer'
                     }))
                 };
                 lastAccessFetchSource = 'MongoDB';
@@ -142,7 +143,7 @@ async function fetchAccess() {
             }
         }
     } catch (e) {
-        console.warn('[access] DB Fetch failed, falling back:', e.message);
+        console.warn('[access] DB Fetch failed or timed out, using cache/fallback:', e.message);
     }
 
     // 2. Try Loading from ENV (Secondary)
@@ -156,23 +157,26 @@ async function fetchAccess() {
         .filter(Boolean);
 
     if (envAdmins.length || envCustomers.length) {
-        accessConfig = {
-            admins: envAdmins.map((discordId) => ({
-                discordId: String(discordId),
-                permissions: ['full'],
-                label: 'ENV ADMIN',
-            })),
-            customers: envCustomers.map((discordId) => ({
-                discordId: String(discordId),
-                label: 'ENV Customer',
-            })),
-        };
-        lastAccessFetchSource = 'ENV ids';
+        // Only override if we don't already have DB users (or merge them)
+        if (!accessConfig.admins.length && !accessConfig.customers.length) {
+            accessConfig = {
+                admins: envAdmins.map((discordId) => ({
+                    discordId: String(discordId),
+                    permissions: ['full'],
+                    label: 'ENV ADMIN',
+                })),
+                customers: envCustomers.map((discordId) => ({
+                    discordId: String(discordId),
+                    label: 'ENV Customer',
+                })),
+            };
+            lastAccessFetchSource = 'ENV ids';
+        }
         console.log(
             '[access] ENV —',
-            accessConfig.admins.length,
+            envAdmins.length,
             'admin(s),',
-            accessConfig.customers.length,
+            envCustomers.length,
             'customer(s)'
         );
         return true;
@@ -213,16 +217,45 @@ async function fetchAccess() {
     return false;
 }
 
-function findAdmin(discordId) {
+async function findAdmin(discordId) {
     if (discordId == null || discordId === '') return null;
     const id = String(discordId);
-    return (accessConfig.admins || []).find((a) => String(a.discordId) === id) || null;
+    
+    // 1. Check memory cache first (Fastest)
+    const cached = (accessConfig.admins || []).find((a) => String(a.discordId) === id);
+    if (cached) return cached;
+
+    // 2. Check DB if connected (with short timeout)
+    if (mongoose.connection.readyState === 1) {
+        try {
+            // Use a short timeout for auth lookups to prevent hanging the API
+            const user = await User.findOne({ discordId: id, role: 'admin' }).maxTimeMS(2000);
+            if (user) return { discordId: user.discordId, permissions: user.permissions, label: user.label };
+        } catch (e) {
+            console.error('[auth] DB Admin lookup failed or timed out:', e.message);
+        }
+    }
+    return null;
 }
 
-function findCustomer(discordId) {
+async function findCustomer(discordId) {
     if (discordId == null || discordId === '') return null;
     const id = String(discordId);
-    return (accessConfig.customers || []).find((c) => String(c.discordId) === id) || null;
+    
+    // 1. Check memory cache first (Fastest)
+    const cached = (accessConfig.customers || []).find((c) => String(c.discordId) === id);
+    if (cached) return cached;
+
+    // 2. Check DB if connected (with short timeout)
+    if (mongoose.connection.readyState === 1) {
+        try {
+            const user = await User.findOne({ discordId: id, role: 'customer' }).maxTimeMS(2000);
+            if (user) return { discordId: user.discordId, label: user.label };
+        } catch (e) {
+            console.error('[auth] DB Customer lookup failed or timed out:', e.message);
+        }
+    }
+    return null;
 }
 
 function hasEnvAdmin(id) {
@@ -240,36 +273,37 @@ function hasEnvCustomer(id) {
 }
 
 /** Admin or customer — may generate PIN and use dashboard */
-function isRegisteredUser(discordId) {
+async function isRegisteredUser(discordId) {
     if (hasEnvAdmin(discordId) || hasEnvCustomer(discordId)) return true;
-    return !!findAdmin(discordId) || !!findCustomer(discordId);
+    return !!(await findAdmin(discordId)) || !!(await findCustomer(discordId));
 }
 
 /** Legacy name — admin panel list */
-function isRegisteredAdmin(discordId) {
-    return isRegisteredUser(discordId);
+async function isRegisteredAdmin(discordId) {
+    return await isRegisteredUser(discordId);
 }
 
-function isCustomerOnly(discordId) {
-    if (hasEnvAdmin(discordId) || findAdmin(discordId)) return false;
-    return hasEnvCustomer(discordId) || !!findCustomer(discordId);
+async function isCustomerOnly(discordId) {
+    if (hasEnvAdmin(discordId)) return false;
+    if (await findAdmin(discordId)) return false;
+    return hasEnvCustomer(discordId) || !!(await findCustomer(discordId));
 }
 
-function hasFullPermission(discordId) {
+async function hasFullPermission(discordId) {
     if (hasEnvAdmin(discordId)) return true;
-    const a = findAdmin(discordId);
+    const a = await findAdmin(discordId);
     if (!a) return false;
     return (a.permissions || []).includes('full');
 }
 
-function canViewSession(viewerId, session) {
-    if (hasFullPermission(viewerId)) return true;
+async function canViewSession(viewerId, session) {
+    if (await hasFullPermission(viewerId)) return true;
     return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
 }
 
-function canDeleteSession(viewerId, session) {
-    if (hasFullPermission(viewerId)) return true;
-    if (!isRegisteredAdmin(viewerId)) return false;
+async function canDeleteSession(viewerId, session) {
+    if (await hasFullPermission(viewerId)) return true;
+    if (!await isRegisteredAdmin(viewerId)) return false;
     return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
 }
 
@@ -281,11 +315,11 @@ app.get('/', (req, res) => res.send('NightGuard API Online v4'));
 app.post('/api/pin/generate', async (req, res) => {
     try {
         const discordId = req.body?.discordId || req.headers['x-discord-id'];
-        let authorized = isRegisteredUser(discordId);
+        let authorized = await isRegisteredUser(discordId);
 
         if (!authorized && !(accessConfig.admins || []).length && !(accessConfig.customers || []).length) {
             await fetchAccess();
-            authorized = isRegisteredUser(discordId);
+            authorized = await isRegisteredUser(discordId);
         }
 
         if (!authorized) {
@@ -351,34 +385,34 @@ app.post('/api/pin/validate', (req, res) => {
 });
 
 // 2. LOG SYSTEM
-app.get('/api/logs', (req, res) => {
+app.get('/api/logs', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
     let list = scanSessions;
-    if (!hasFullPermission(viewer)) {
-        list = scanSessions.filter((s) => canViewSession(viewer, s));
+    if (!await hasFullPermission(viewer)) {
+        list = scanSessions.filter((s) => (s.pinOwnerDiscordId === String(viewer)));
     }
     res.json({ success: true, logs: list });
 });
 
-app.get('/api/logs/:id', (req, res) => {
+app.get('/api/logs/:id', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
     const session = scanSessions.find((s) => s.sessionId === req.params.id);
     if (!session) {
         return res.status(404).json({ success: false, message: 'Session not found' });
     }
-    if (!canViewSession(viewer, session)) {
+    if (!await canViewSession(viewer, session)) {
         return res.status(403).json({ success: false, message: 'Forbidden' });
     }
     res.json({ success: true, session });
 });
 
-app.delete('/api/logs/:id', (req, res) => {
+app.delete('/api/logs/:id', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
     const session = scanSessions.find((s) => s.sessionId === req.params.id);
     if (!session) {
         return res.status(404).json({ success: false, message: 'Session not found' });
     }
-    if (!canDeleteSession(viewer, session)) {
+    if (!await canDeleteSession(viewer, session)) {
         return res.status(403).json({ success: false, message: 'Forbidden' });
     }
     scanSessions = scanSessions.filter((s) => s.sessionId !== req.params.id);
@@ -458,9 +492,9 @@ app.get('/api/stats', (req, res) => {
 });
 
 // 4. ADMIN INSPECTION LOGS - CUSTOMER OVERVIEW
-app.get('/api/admin/customer-stats', (req, res) => {
+app.get('/api/admin/customer-stats', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Admins only' });
     }
 
@@ -493,17 +527,17 @@ app.get('/api/admin/customer-stats', (req, res) => {
     res.json({ success: true, customers: result });
 });
 
-app.get('/api/settings', (req, res) => {
+app.get('/api/settings', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden' });
     }
     res.json(systemSettings);
 });
 
-app.post('/api/settings', (req, res) => {
+app.post('/api/settings', async (req, res) => {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden' });
     }
     const { viewerDiscordId, ...rest } = req.body || {};
@@ -512,9 +546,9 @@ app.post('/api/settings', (req, res) => {
 });
 
 // 4. Access roster — full admins only (admins + customers lists)
-app.get('/api/access/roster', (req, res) => {
+app.get('/api/access/roster', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Admins only' });
     }
     res.json({
@@ -525,9 +559,9 @@ app.get('/api/access/roster', (req, res) => {
 });
 
 /** @deprecated use /api/access/roster */
-app.get('/api/admin/admins', (req, res) => {
+app.get('/api/admin/admins', async (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden' });
     }
     res.json({ success: true, admins: accessConfig.admins || [] });
@@ -539,13 +573,13 @@ app.post('/api/access/add', async (req, res) => {
     return handleManageAccess(req, res);
 });
 
-app.post('/api/access/manage', (req, res) => {
+app.post('/api/access/manage', async (req, res) => {
     return handleManageAccess(req, res);
 });
 
 async function handleManageAccess(req, res) {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
@@ -605,10 +639,10 @@ async function handleManageAccess(req, res) {
 }
 
 /** @deprecated — adds to admins list only */
-app.post('/api/admin/manage', (req, res) => {
+app.post('/api/admin/manage', async (req, res) => {
     req.body = { ...(req.body || {}), role: 'admin' };
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden' });
     }
     const { action, discordId, permissions, label } = req.body || {};
