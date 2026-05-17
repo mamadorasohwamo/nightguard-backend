@@ -351,6 +351,42 @@ app.get('/api/stats', (req, res) => {
     });
 });
 
+// 4. ADMIN INSPECTION LOGS - CUSTOMER OVERVIEW
+app.get('/api/admin/customer-stats', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden', message: 'Admins only' });
+    }
+
+    const customerMap = new Map();
+
+    // Group scans by owner
+    scanSessions.forEach(session => {
+        const ownerId = session.pinOwnerDiscordId || 'unknown';
+        if (!customerMap.has(ownerId)) {
+            customerMap.set(ownerId, {
+                discordId: ownerId,
+                totalScans: 0,
+                totalDetections: 0,
+                latestScan: null,
+                riskScoreSum: 0
+            });
+        }
+        const data = customerMap.get(ownerId);
+        data.totalScans++;
+        data.totalDetections += (session.detections?.length || 0);
+        
+        const scanDate = new Date(session.scanTime);
+        if (!data.latestScan || scanDate > new Date(data.latestScan)) {
+            data.latestScan = session.scanTime;
+        }
+        data.riskScoreSum += (session.riskLevel || 0);
+    });
+
+    const result = Array.from(customerMap.values());
+    res.json({ success: true, customers: result });
+});
+
 app.get('/api/settings', (req, res) => {
     const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
     if (!hasFullPermission(viewer)) {
