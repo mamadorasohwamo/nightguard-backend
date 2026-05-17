@@ -7,31 +7,15 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const mongoose = require('mongoose');
 const { Octokit } = require('@octokit/rest');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// --- Database Configuration ---
-const MONGODB_URI = process.env.MONGODB_URI;
+// --- Configuration ---
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_REPO_OWNER;
 const GITHUB_REPO = process.env.GITHUB_REPO_NAME;
-
-const userSchema = new mongoose.Schema({
-    discordId: { type: String, required: true, unique: true },
-    username: String,
-    label: String,
-    role: { type: String, enum: ['admin', 'customer'], default: 'customer' },
-    permissions: [String],
-    added_at: { type: Date, default: Date.now }
-}, { 
-    collection: 'users',
-    bufferCommands: false // Disable buffering to fail fast if connection is not ready
-});
-
-const User = mongoose.model('User', userSchema);
 
 // --- GitHub Octokit Configuration ---
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
@@ -67,30 +51,17 @@ let systemSettings = {
     pinExpiryMinutes: 60
 };
 
-async function syncAccessToGitHub() {
+async function syncAccessToGitHub(newConfig) {
     if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
         console.warn('[github] Missing credentials for sync');
-        return;
+        return false;
     }
 
     try {
         const filePath = 'public/access.json';
-        
-        // 1. Fetch latest users from DB
-        const allUsers = await User.find({});
-        const admins = allUsers.filter(u => u.role === 'admin').map(u => ({
-            discordId: u.discordId,
-            permissions: u.permissions || ['full'],
-            label: u.label || u.username || 'Admin'
-        }));
-        const customers = allUsers.filter(u => u.role === 'customer').map(u => ({
-            discordId: u.discordId,
-            label: u.label || u.username || 'Customer'
-        }));
+        const newContent = JSON.stringify(newConfig, null, 4);
 
-        const newContent = JSON.stringify({ admins, customers }, null, 4);
-
-        // 2. Get file SHA
+        // 1. Get file SHA
         let sha;
         try {
             const { data } = await octokit.repos.getContent({
@@ -103,7 +74,7 @@ async function syncAccessToGitHub() {
             console.warn('[github] access.json not found, creating new');
         }
 
-        // 3. Update file
+        // 2. Update file on GitHub
         await octokit.repos.createOrUpdateFileContents({
             owner: GITHUB_OWNER,
             repo: GITHUB_REPO,
@@ -114,39 +85,15 @@ async function syncAccessToGitHub() {
         });
 
         console.log('[github] access.json successfully synced to GitHub');
+        return true;
     } catch (e) {
         console.error('[github] Sync failed:', e.message);
+        return false;
     }
 }
 
 async function fetchAccess() {
-    // 1. Try Loading from Database (Primary)
-    try {
-        if (mongoose.connection.readyState === 1) {
-            // Added timeout to prevent fetchAccess from hanging the boot/refresh cycle
-            const dbUsers = await User.find({}).maxTimeMS(5000);
-            if (dbUsers && dbUsers.length > 0) {
-                accessConfig = {
-                    admins: dbUsers.filter(u => u.role === 'admin').map(u => ({
-                        discordId: u.discordId,
-                        permissions: u.permissions || ['full'],
-                        label: u.label || 'Admin'
-                    })),
-                    customers: dbUsers.filter(u => u.role === 'customer').map(u => ({
-                        discordId: u.discordId,
-                        label: u.label || 'Customer'
-                    }))
-                };
-                lastAccessFetchSource = 'MongoDB';
-                console.log(`[access] MongoDB — ${accessConfig.admins.length} admins, ${accessConfig.customers.length} customers`);
-                return true;
-            }
-        }
-    } catch (e) {
-        console.warn('[access] DB Fetch failed or timed out, using cache/fallback:', e.message);
-    }
-
-    // 2. Try Loading from ENV (Secondary)
+    // 1. Try Loading from ENV (Primary Fallback)
     const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
         .split(',')
         .map((s) => s.trim())
@@ -157,32 +104,23 @@ async function fetchAccess() {
         .filter(Boolean);
 
     if (envAdmins.length || envCustomers.length) {
-        // Only override if we don't already have DB users (or merge them)
-        if (!accessConfig.admins.length && !accessConfig.customers.length) {
-            accessConfig = {
-                admins: envAdmins.map((discordId) => ({
-                    discordId: String(discordId),
-                    permissions: ['full'],
-                    label: 'ENV ADMIN',
-                })),
-                customers: envCustomers.map((discordId) => ({
-                    discordId: String(discordId),
-                    label: 'ENV Customer',
-                })),
-            };
-            lastAccessFetchSource = 'ENV ids';
-        }
-        console.log(
-            '[access] ENV —',
-            envAdmins.length,
-            'admin(s),',
-            envCustomers.length,
-            'customer(s)'
-        );
+        accessConfig = {
+            admins: envAdmins.map((discordId) => ({
+                discordId: String(discordId),
+                permissions: ['full'],
+                label: 'ENV ADMIN',
+            })),
+            customers: envCustomers.map((discordId) => ({
+                discordId: String(discordId),
+                label: 'ENV Customer',
+            })),
+        };
+        lastAccessFetchSource = 'ENV ids';
+        console.log('[access] Loaded from ENV');
         return true;
     }
 
-    // 3. Try Loading from External access.json URLs (Fallback)
+    // 2. Try Loading from External access.json URLs (GitHub/Vercel)
     for (const url of ACCESS_JSON_URL_CANDIDATES) {
         try {
             const res = await fetch(url, { cache: 'no-store' });
@@ -196,14 +134,7 @@ async function fetchAccess() {
                 customers: Array.isArray(data.customers) ? data.customers : [],
             };
             lastAccessFetchSource = url;
-            console.log(
-                '[access] Loaded —',
-                accessConfig.admins.length,
-                'admin(s),',
-                accessConfig.customers.length,
-                'customer(s) from',
-                url
-            );
+            console.log('[access] Loaded from', url);
             return true;
         } catch (e) {
             console.warn('[access] Failed to fetch', url, '—', e.message || e);
@@ -211,51 +142,19 @@ async function fetchAccess() {
     }
 
     accessConfig = { admins: [], customers: [] };
-    console.error(
-        '[access] CRITICAL: No access list loaded. Set MONGODB_URI or env IDs.'
-    );
     return false;
 }
 
-async function findAdmin(discordId) {
+function findAdmin(discordId) {
     if (discordId == null || discordId === '') return null;
     const id = String(discordId);
-    
-    // 1. Check memory cache first (Fastest)
-    const cached = (accessConfig.admins || []).find((a) => String(a.discordId) === id);
-    if (cached) return cached;
-
-    // 2. Check DB if connected (with short timeout)
-    if (mongoose.connection.readyState === 1) {
-        try {
-            // Use a short timeout for auth lookups to prevent hanging the API
-            const user = await User.findOne({ discordId: id, role: 'admin' }).maxTimeMS(2000);
-            if (user) return { discordId: user.discordId, permissions: user.permissions, label: user.label };
-        } catch (e) {
-            console.error('[auth] DB Admin lookup failed or timed out:', e.message);
-        }
-    }
-    return null;
+    return (accessConfig.admins || []).find((a) => String(a.discordId) === id) || null;
 }
 
-async function findCustomer(discordId) {
+function findCustomer(discordId) {
     if (discordId == null || discordId === '') return null;
     const id = String(discordId);
-    
-    // 1. Check memory cache first (Fastest)
-    const cached = (accessConfig.customers || []).find((c) => String(c.discordId) === id);
-    if (cached) return cached;
-
-    // 2. Check DB if connected (with short timeout)
-    if (mongoose.connection.readyState === 1) {
-        try {
-            const user = await User.findOne({ discordId: id, role: 'customer' }).maxTimeMS(2000);
-            if (user) return { discordId: user.discordId, label: user.label };
-        } catch (e) {
-            console.error('[auth] DB Customer lookup failed or timed out:', e.message);
-        }
-    }
-    return null;
+    return (accessConfig.customers || []).find((c) => String(c.discordId) === id) || null;
 }
 
 function hasEnvAdmin(id) {
@@ -272,38 +171,35 @@ function hasEnvCustomer(id) {
         .includes(String(id));
 }
 
-/** Admin or customer — may generate PIN and use dashboard */
-async function isRegisteredUser(discordId) {
+function isRegisteredUser(discordId) {
     if (hasEnvAdmin(discordId) || hasEnvCustomer(discordId)) return true;
-    return !!(await findAdmin(discordId)) || !!(await findCustomer(discordId));
+    return !!findAdmin(discordId) || !!findCustomer(discordId);
 }
 
-/** Legacy name — admin panel list */
-async function isRegisteredAdmin(discordId) {
-    return await isRegisteredUser(discordId);
+function isRegisteredAdmin(discordId) {
+    return isRegisteredUser(discordId);
 }
 
-async function isCustomerOnly(discordId) {
-    if (hasEnvAdmin(discordId)) return false;
-    if (await findAdmin(discordId)) return false;
-    return hasEnvCustomer(discordId) || !!(await findCustomer(discordId));
+function isCustomerOnly(discordId) {
+    if (hasEnvAdmin(discordId) || findAdmin(discordId)) return false;
+    return hasEnvCustomer(discordId) || !!findCustomer(discordId);
 }
 
-async function hasFullPermission(discordId) {
+function hasFullPermission(discordId) {
     if (hasEnvAdmin(discordId)) return true;
-    const a = await findAdmin(discordId);
+    const a = findAdmin(discordId);
     if (!a) return false;
     return (a.permissions || []).includes('full');
 }
 
-async function canViewSession(viewerId, session) {
-    if (await hasFullPermission(viewerId)) return true;
+function canViewSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
     return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
 }
 
-async function canDeleteSession(viewerId, session) {
-    if (await hasFullPermission(viewerId)) return true;
-    if (!await isRegisteredAdmin(viewerId)) return false;
+function canDeleteSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
+    if (!isRegisteredAdmin(viewerId)) return false;
     return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
 }
 
@@ -579,62 +475,68 @@ app.post('/api/access/manage', async (req, res) => {
 
 async function handleManageAccess(req, res) {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
-    if (!await hasFullPermission(viewer)) {
+    if (!hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
-    // Check if database is connected
-    if (mongoose.connection.readyState !== 1) {
-        console.error('[access] Database not connected. Current state:', mongoose.connection.readyState);
-        return res.status(503).json({ 
-            success: false, 
-            error: 'database_offline', 
-            message: 'Database connection is not active. Please check your MONGODB_URI and IP whitelist.' 
-        });
-    }
-
-    const { action, discordId, role, permissions, label, username } = req.body || {};
+    const { action, discordId, role, permissions, label } = req.body || {};
     if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
         return res.status(400).json({ success: false, error: 'invalid_discord_id' });
     }
+    const listRole = role === 'customer' ? 'customer' : 'admin';
     const id = String(discordId);
-    const targetRole = role === 'customer' ? 'customer' : 'admin';
+
+    // Current config
+    let admins = [...(accessConfig.admins || [])];
+    let customers = [...(accessConfig.customers || [])];
+
+    const removeFromBoth = () => {
+        admins = admins.filter(a => String(a.discordId) !== id);
+        customers = customers.filter(c => String(c.discordId) !== id);
+    };
 
     try {
         if (action === 'remove') {
-            await User.deleteOne({ discordId: id });
-            console.log(`[access] Removed ${id} from DB`);
+            removeFromBoth();
         } else if (action === 'add' || action === 'give') {
-            const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
-            await User.findOneAndUpdate(
-                { discordId: id },
-                { 
+            removeFromBoth();
+            if (listRole === 'customer') {
+                customers.push({
                     discordId: id,
-                    role: targetRole,
-                    permissions: targetRole === 'admin' ? perms : [],
-                    label: label || (targetRole === 'admin' ? 'NightGuard Admin' : 'NightGuard Customer'),
-                    username: username || ''
-                },
-                { upsert: true, new: true }
-            );
-            console.log(`[access] Added/Updated ${id} as ${targetRole} in DB`);
+                    label: label || 'NightGuard Customer',
+                });
+            } else {
+                const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+                admins.push({
+                    discordId: id,
+                    permissions: perms,
+                    label: label || 'NightGuard Admin',
+                });
+            }
         } else {
             return res.status(400).json({ success: false, error: 'action must be add or remove' });
         }
 
-        // Refresh local config and sync to GitHub
-        await fetchAccess();
-        await syncAccessToGitHub();
+        const newConfig = { admins, customers };
+
+        // SYNC TO GITHUB
+        const syncOk = await syncAccessToGitHub(newConfig);
+        if (!syncOk) {
+            return res.status(500).json({ success: false, error: 'github_sync_failed' });
+        }
+
+        // Update local memory only after successful GitHub sync
+        accessConfig = newConfig;
 
         res.json({
             success: true,
             admins: accessConfig.admins,
             customers: accessConfig.customers,
-            note: 'Successfully updated database and synced to GitHub.',
+            note: 'Successfully updated access.json on GitHub.',
         });
     } catch (e) {
         console.error('[access] Manage failed:', e.message);
-        res.status(500).json({ success: false, error: 'database_error', message: e.message });
+        res.status(500).json({ success: false, error: 'internal_error', message: e.message });
     }
 }
 
@@ -717,31 +619,6 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 async function boot() {
-    // 1. Connect to MongoDB
-    if (MONGODB_URI) {
-        try {
-            console.log('[db] Attempting to connect to MongoDB...');
-            await mongoose.connect(MONGODB_URI, {
-                serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
-                socketTimeoutMS: 45000,
-            });
-            console.log('[db] Connected to MongoDB');
-        } catch (e) {
-            console.error('[db] Connection failed:', e.message);
-            console.warn('[db] Proceeding in fallback mode. DB operations will fail until reconnected.');
-        }
-    } else {
-        console.warn('[db] MONGODB_URI not set, using fallback access modes');
-    }
-
-    // Monitor connection events
-    mongoose.connection.on('error', err => {
-        console.error('[db] Mongoose connection error:', err);
-    });
-    mongoose.connection.on('disconnected', () => {
-        console.warn('[db] Mongoose disconnected');
-    });
-
     await fetchAccess();
 
     const refreshRaw = process.env.ACCESS_JSON_REFRESH_MS || process.env.ADMIN_JSON_REFRESH_MS;
@@ -756,9 +633,9 @@ async function boot() {
 
     app.listen(PORT, () => {
         console.log(`=========================================`);
-        console.log(`NightGuard AC Backend v5 - Online`);
+        console.log(`NightGuard AC Backend - Online`);
         console.log(`Port: ${PORT}`);
-        console.log(`Access Mode: ${lastAccessFetchSource}`);
+        console.log(`Access Source: ${lastAccessFetchSource}`);
         console.log(
             `Loaded: ${(accessConfig.admins || []).length} admin(s), ` +
             `${(accessConfig.customers || []).length} customer(s)`
