@@ -53,20 +53,16 @@ let systemSettings = {
 
 async function syncAccessToGitHub(newConfig) {
     if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-        console.error('[github] CRITICAL: Missing configuration!');
-        console.error(`[github] Token Present: ${!!GITHUB_TOKEN}`);
-        console.error(`[github] Owner: ${GITHUB_OWNER}`);
-        console.error(`[github] Repo: ${GITHUB_REPO}`);
+        console.error('[github] CRITICAL: Missing configuration! Check GITHUB_TOKEN, GITHUB_REPO_OWNER, GITHUB_REPO_NAME.');
         return false;
     }
 
     try {
-        const filePath = 'public/access.json';
+        const filePath = 'access.json'; 
         const newContent = JSON.stringify(newConfig, null, 4);
 
-        console.log(`[github] Starting sync for ${GITHUB_OWNER}/${GITHUB_REPO}/${filePath}...`);
+        console.log(`[github] Syncing access.json to ${GITHUB_OWNER}/${GITHUB_REPO}...`);
 
-        // 1. Get file SHA (Required for updates)
         let sha;
         try {
             const { data } = await octokit.repos.getContent({
@@ -75,35 +71,23 @@ async function syncAccessToGitHub(newConfig) {
                 path: filePath
             });
             sha = data.sha;
-            console.log('[github] Successfully retrieved current file SHA:', sha);
         } catch (e) {
-            if (e.status === 404) {
-                console.warn('[github] access.json not found on GitHub. A new file will be created.');
-            } else {
-                console.error('[github] Error fetching file info:', e.message, 'Status:', e.status);
-                throw e; 
-            }
+            if (e.status !== 404) throw e;
         }
 
-        // 2. Push update to GitHub
-        const updateResponse = await octokit.repos.createOrUpdateFileContents({
+        await octokit.repos.createOrUpdateFileContents({
             owner: GITHUB_OWNER,
             repo: GITHUB_REPO,
             path: filePath,
-            message: `chore: dashboard update - ${new Date().toLocaleString()}`,
+            message: `chore: dashboard update - ${new Date().toISOString()}`,
             content: Buffer.from(newContent).toString('base64'),
-            sha // If sha is undefined, GitHub creates the file. If defined, it updates.
+            sha
         });
 
-        console.log('[github] Sync COMPLETED. New Commit SHA:', updateResponse.data.commit.sha);
+        console.log('[github] Sync successful');
         return true;
     } catch (e) {
-        console.error('[github] SYNC FAILED!');
-        console.error('[github] Error Message:', e.message);
-        if (e.response) {
-            console.error('[github] GitHub API Response Data:', JSON.stringify(e.response.data, null, 2));
-            console.error('[github] HTTP Status:', e.response.status);
-        }
+        console.error('[github] Sync failed:', e.response?.data || e.message);
         return false;
     }
 }
@@ -491,6 +475,10 @@ app.post('/api/access/manage', async (req, res) => {
 
 async function handleManageAccess(req, res) {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    
+    // Log the request for debugging
+    console.log(`[access] Manage request from: ${viewer}`);
+
     if (!hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
@@ -502,54 +490,57 @@ async function handleManageAccess(req, res) {
     const listRole = role === 'customer' ? 'customer' : 'admin';
     const id = String(discordId);
 
-    // Current config
-    let admins = [...(accessConfig.admins || [])];
-    let customers = [...(accessConfig.customers || [])];
-
-    const removeFromBoth = () => {
-        admins = admins.filter(a => String(a.discordId) !== id);
-        customers = customers.filter(c => String(c.discordId) !== id);
-    };
-
     try {
+        // 1. Fetch current config from GitHub
+        const filePath = 'access.json';
+        let currentConfig = { admins: [], customers: [] };
+
+        try {
+            const { data } = await octokit.repos.getContent({
+                owner: GITHUB_OWNER,
+                repo: GITHUB_REPO,
+                path: filePath
+            });
+            const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
+            currentConfig = JSON.parse(content);
+        } catch (e) {
+            console.warn('[access] Could not fetch latest config, using memory fallback:', e.message);
+            currentConfig = accessConfig;
+        }
+
+        let admins = [...(currentConfig.admins || [])];
+        let customers = [...(currentConfig.customers || [])];
+
+        const removeFromBoth = () => {
+            admins = admins.filter(a => String(a.discordId) !== id);
+            customers = customers.filter(c => String(c.discordId) !== id);
+        };
+
         if (action === 'remove') {
             removeFromBoth();
         } else if (action === 'add' || action === 'give') {
             removeFromBoth();
             if (listRole === 'customer') {
-                customers.push({
-                    discordId: id,
-                    label: label || 'NightGuard Customer',
-                });
+                customers.push({ discordId: id, label: label || 'NightGuard Customer' });
             } else {
-                const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
                 admins.push({
                     discordId: id,
-                    permissions: perms,
-                    label: label || 'NightGuard Admin',
+                    permissions: Array.isArray(permissions) ? permissions : ['full'],
+                    label: label || 'NightGuard Admin'
                 });
             }
-        } else {
-            return res.status(400).json({ success: false, error: 'action must be add or remove' });
         }
 
         const newConfig = { admins, customers };
 
-        // SYNC TO GITHUB
+        // 2. Sync to GitHub
         const syncOk = await syncAccessToGitHub(newConfig);
         if (!syncOk) {
             return res.status(500).json({ success: false, error: 'github_sync_failed' });
         }
 
-        // Update local memory only after successful GitHub sync
         accessConfig = newConfig;
-
-        res.json({
-            success: true,
-            admins: accessConfig.admins,
-            customers: accessConfig.customers,
-            note: 'Successfully updated access.json on GitHub.',
-        });
+        res.json({ success: true, admins: accessConfig.admins, customers: accessConfig.customers });
     } catch (e) {
         console.error('[access] Manage failed:', e.message);
         res.status(500).json({ success: false, error: 'internal_error', message: e.message });
