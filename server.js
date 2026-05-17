@@ -26,28 +26,64 @@ const storage = {
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 
+// Request Logging Middleware
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
+});
+
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if (!token) return res.sendStatus(401);
+    if (!token) {
+        console.log(`[AUTH] Missing token for ${req.url}`);
+        return res.status(401).json({ success: false, error: 'Authentication token required' });
+    }
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
+        if (err) {
+            console.log(`[AUTH] Invalid token for ${req.url}: ${err.message}`);
+            return res.status(403).json({ success: false, error: 'Invalid or expired token' });
+        }
         req.user = user;
         next();
     });
 };
 
 const isAdmin = (req, res, next) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    if (req.user.role !== 'admin') {
+        console.log(`[AUTH] Admin access denied for user ${req.user.id}`);
+        return res.status(403).json({ success: false, error: 'Admin access required' });
+    }
     next();
 };
 
 // --- API ROUTES ---
 
-app.get('/', (req, res) => res.send('NightGuard Enterprise API Online v5 (In-Memory)'));
+app.get('/', (req, res) => res.json({ status: 'online', message: 'NightGuard Enterprise API Online v5 (In-Memory)' }));
+
+// 0. Stats Route
+app.get('/api/stats', (req, res) => {
+    const totalScans = storage.scans.length;
+    const totalUsers = storage.customers.length;
+    const criticalDetections = storage.detections.filter(d => d.severity === 'CRITICAL').length;
+    const flaggedScans = storage.scans.filter(s => s.risk_score > 50).length;
+    const activePins = storage.generated_pins.filter(p => new Date(p.expires_at) > new Date()).length;
+
+    res.json({
+        success: true,
+        stats: {
+            totalScans,
+            flaggedScans,
+            uniqueUsers: totalUsers,
+            activePins,
+            criticalDetections,
+            onlineUsers: totalUsers // Placeholder
+        }
+    });
+});
 
 // 1. Authentication (Discord OAuth2 placeholder)
 app.post('/api/auth/discord', async (req, res) => {
@@ -172,6 +208,27 @@ app.get('/api/admin/customer/:id/scans', authenticateToken, isAdmin, (req, res) 
         .filter(s => s.customer_id === customerId)
         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json(customerScans);
+});
+
+// --- ERROR HANDLING ---
+
+// Fallback for unknown API routes
+app.use('/api/*', (req, res) => {
+    console.log(`[404] Route not found: ${req.method} ${req.url}`);
+    res.status(404).json({
+        success: false,
+        error: 'API route not found'
+    });
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+    console.error(`[ERROR] ${err.stack}`);
+    res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        message: err.message
+    });
 });
 
 app.listen(PORT, () => {
