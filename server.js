@@ -26,6 +26,9 @@ const userSchema = new mongoose.Schema({
     role: { type: String, enum: ['admin', 'customer'], default: 'customer' },
     permissions: [String],
     added_at: { type: Date, default: Date.now }
+}, { 
+    collection: 'users',
+    bufferCommands: false // Disable buffering to fail fast if connection is not ready
 });
 
 const User = mongoose.model('User', userSchema);
@@ -546,6 +549,16 @@ async function handleManageAccess(req, res) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
+    // Check if database is connected
+    if (mongoose.connection.readyState !== 1) {
+        console.error('[access] Database not connected. Current state:', mongoose.connection.readyState);
+        return res.status(503).json({ 
+            success: false, 
+            error: 'database_offline', 
+            message: 'Database connection is not active. Please check your MONGODB_URI and IP whitelist.' 
+        });
+    }
+
     const { action, discordId, role, permissions, label, username } = req.body || {};
     if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
         return res.status(400).json({ success: false, error: 'invalid_discord_id' });
@@ -673,14 +686,27 @@ async function boot() {
     // 1. Connect to MongoDB
     if (MONGODB_URI) {
         try {
-            await mongoose.connect(MONGODB_URI);
+            console.log('[db] Attempting to connect to MongoDB...');
+            await mongoose.connect(MONGODB_URI, {
+                serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+                socketTimeoutMS: 45000,
+            });
             console.log('[db] Connected to MongoDB');
         } catch (e) {
             console.error('[db] Connection failed:', e.message);
+            console.warn('[db] Proceeding in fallback mode. DB operations will fail until reconnected.');
         }
     } else {
         console.warn('[db] MONGODB_URI not set, using fallback access modes');
     }
+
+    // Monitor connection events
+    mongoose.connection.on('error', err => {
+        console.error('[db] Mongoose connection error:', err);
+    });
+    mongoose.connection.on('disconnected', () => {
+        console.warn('[db] Mongoose disconnected');
+    });
 
     await fetchAccess();
 
