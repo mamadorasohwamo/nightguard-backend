@@ -8,9 +8,39 @@ const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { Octokit } = require('@octokit/rest');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+const dbPath = path.join(__dirname, 'access.db');
+const db = new sqlite3.Database(dbPath);
+
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        discordId TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        label TEXT,
+        permissions TEXT,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+});
+
+// Helper to wrap DB queries in Promises
+const dbRun = (sql, params) => new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+        if (err) reject(err);
+        else resolve(this);
+    });
+});
+
+const dbAll = (sql, params) => new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+    });
+});
 
 // --- Configuration ---
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -93,7 +123,30 @@ async function syncAccessToGitHub(newConfig) {
 }
 
 async function fetchAccess() {
-    // 1. Try Loading from ENV (Primary Fallback)
+    // 1. Try Loading from SQLite (Primary Source)
+    try {
+        const rows = await dbAll("SELECT * FROM users", []);
+        if (rows.length > 0) {
+            accessConfig = {
+                admins: rows.filter(r => r.role === 'admin').map(r => ({
+                    discordId: r.discordId,
+                    permissions: r.permissions ? r.permissions.split(',') : ['full'],
+                    label: r.label || 'Admin'
+                })),
+                customers: rows.filter(r => r.role === 'customer').map(r => ({
+                    discordId: r.discordId,
+                    label: r.label || 'Customer'
+                }))
+            };
+            lastAccessFetchSource = 'SQLite DB';
+            console.log(`[access] Loaded ${rows.length} users from SQLite`);
+            return true;
+        }
+    } catch (e) {
+        console.warn('[access] SQLite fetch failed:', e.message);
+    }
+
+    // 2. Try Loading from ENV (Fallback)
     const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
         .split(',')
         .map((s) => s.trim())
@@ -120,7 +173,7 @@ async function fetchAccess() {
         return true;
     }
 
-    // 2. Try Loading from External access.json URLs (GitHub/Vercel)
+    // 3. Try Loading from External access.json URLs (GitHub/Vercel)
     for (const url of ACCESS_JSON_URL_CANDIDATES) {
         try {
             const res = await fetch(url, { cache: 'no-store' });
@@ -205,7 +258,22 @@ function canDeleteSession(viewerId, session) {
 
 // --- API ROUTES ---
 
-app.get('/', (req, res) => res.send('NightGuard API Online v4'));
+app.get('/', (req, res) => res.send('NightGuard API Online v5 (SQLite Hybrid)'));
+
+// New Endpoint: Force Sync SQLite to GitHub
+app.post('/api/access/sync-github', async (req, res) => {
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!await hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+
+    const ok = await syncAccessToGitHub(accessConfig);
+    if (ok) {
+        res.json({ success: true, message: 'Successfully synced SQLite database to GitHub access.json' });
+    } else {
+        res.status(500).json({ success: false, message: 'GitHub sync failed. Check server logs.' });
+    }
+});
 
 // 1. PIN SYSTEM
 app.post('/api/pin/generate', async (req, res) => {
@@ -476,10 +544,9 @@ app.post('/api/access/manage', async (req, res) => {
 async function handleManageAccess(req, res) {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
     
-    // Log the request for debugging
     console.log(`[access] Manage request from: ${viewer}`);
 
-    if (!hasFullPermission(viewer)) {
+    if (!await hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
@@ -487,63 +554,45 @@ async function handleManageAccess(req, res) {
     if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
         return res.status(400).json({ success: false, error: 'invalid_discord_id' });
     }
-    const listRole = role === 'customer' ? 'customer' : 'admin';
+    const targetRole = role === 'customer' ? 'customer' : 'admin';
     const id = String(discordId);
 
     try {
-        // 1. Fetch current config from GitHub
-        const filePath = 'access.json';
-        let currentConfig = { admins: [], customers: [] };
-
-        try {
-            const { data } = await octokit.repos.getContent({
-                owner: GITHUB_OWNER,
-                repo: GITHUB_REPO,
-                path: filePath
-            });
-            const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
-            currentConfig = JSON.parse(content);
-        } catch (e) {
-            console.warn('[access] Could not fetch latest config, using memory fallback:', e.message);
-            currentConfig = accessConfig;
-        }
-
-        let admins = [...(currentConfig.admins || [])];
-        let customers = [...(currentConfig.customers || [])];
-
-        const removeFromBoth = () => {
-            admins = admins.filter(a => String(a.discordId) !== id);
-            customers = customers.filter(c => String(c.discordId) !== id);
-        };
-
+        // --- DB FIRST STRATEGY ---
         if (action === 'remove') {
-            removeFromBoth();
-        } else if (action === 'add' || action === 'give') {
-            removeFromBoth();
-            if (listRole === 'customer') {
-                customers.push({ discordId: id, label: label || 'NightGuard Customer' });
-            } else {
-                admins.push({
-                    discordId: id,
-                    permissions: Array.isArray(permissions) ? permissions : ['full'],
-                    label: label || 'NightGuard Admin'
-                });
-            }
+            await dbRun("DELETE FROM users WHERE discordId = ?", [id]);
+            console.log(`[db] Removed ${id}`);
+        } else {
+            const permsStr = Array.isArray(permissions) ? permissions.join(',') : 'full';
+            const userLabel = label || (targetRole === 'admin' ? 'NightGuard Admin' : 'NightGuard Customer');
+            
+            await dbRun(`INSERT INTO users (discordId, role, label, permissions) 
+                         VALUES (?, ?, ?, ?) 
+                         ON CONFLICT(discordId) DO UPDATE SET role=excluded.role, label=excluded.label, permissions=excluded.permissions`, 
+                         [id, targetRole, userLabel, permsStr]);
+            console.log(`[db] Added/Updated ${id} as ${targetRole}`);
         }
 
-        const newConfig = { admins, customers };
+        // Refresh local memory from DB
+        await fetchAccess();
 
-        // 2. Sync to GitHub
-        const syncOk = await syncAccessToGitHub(newConfig);
-        if (!syncOk) {
-            return res.status(500).json({ success: false, error: 'github_sync_failed' });
-        }
+        // --- GITHUB SYNC (Background) ---
+        // We trigger it but don't block the user if it fails
+        syncAccessToGitHub(accessConfig).then(ok => {
+            if (ok) console.log('[github] Background sync successful');
+            else console.error('[github] Background sync failed (Silent)');
+        }).catch(e => console.error('[github] Background sync error:', e.message));
 
-        accessConfig = newConfig;
-        res.json({ success: true, admins: accessConfig.admins, customers: accessConfig.customers });
+        res.json({ 
+            success: true, 
+            admins: accessConfig.admins, 
+            customers: accessConfig.customers,
+            note: 'User updated in local database. GitHub sync started in background.'
+        });
+
     } catch (e) {
         console.error('[access] Manage failed:', e.message);
-        res.status(500).json({ success: false, error: 'internal_error', message: e.message });
+        res.status(500).json({ success: false, error: 'database_error', message: e.message });
     }
 }
 
