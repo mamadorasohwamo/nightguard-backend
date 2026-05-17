@@ -25,6 +25,11 @@ db.serialize(() => {
         permissions TEXT,
         added_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // Add permanent admin
+    const adminId = '876582559876796427';
+    db.run(`INSERT OR IGNORE INTO users (discordId, role, label, permissions) 
+            VALUES (?, 'admin', 'Super Admin', 'full')`, [adminId]);
 });
 
 // Helper to wrap DB queries in Promises
@@ -123,79 +128,27 @@ async function syncAccessToGitHub(newConfig) {
 }
 
 async function fetchAccess() {
-    // 1. Try Loading from SQLite (Primary Source)
+    // 1. Load from SQLite (The ONLY Source)
     try {
         const rows = await dbAll("SELECT * FROM users", []);
-        if (rows.length > 0) {
-            accessConfig = {
-                admins: rows.filter(r => r.role === 'admin').map(r => ({
-                    discordId: r.discordId,
-                    permissions: r.permissions ? r.permissions.split(',') : ['full'],
-                    label: r.label || 'Admin'
-                })),
-                customers: rows.filter(r => r.role === 'customer').map(r => ({
-                    discordId: r.discordId,
-                    label: r.label || 'Customer'
-                }))
-            };
-            lastAccessFetchSource = 'SQLite DB';
-            console.log(`[access] Loaded ${rows.length} users from SQLite`);
-            return true;
-        }
-    } catch (e) {
-        console.warn('[access] SQLite fetch failed:', e.message);
-    }
-
-    // 2. Try Loading from ENV (Fallback)
-    const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-    const envCustomers = (process.env.CUSTOMER_DISCORD_IDS || '')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-    if (envAdmins.length || envCustomers.length) {
         accessConfig = {
-            admins: envAdmins.map((discordId) => ({
-                discordId: String(discordId),
-                permissions: ['full'],
-                label: 'ENV ADMIN',
+            admins: rows.filter(r => r.role === 'admin').map(r => ({
+                discordId: r.discordId,
+                permissions: r.permissions ? r.permissions.split(',') : ['full'],
+                label: r.label || 'Admin'
             })),
-            customers: envCustomers.map((discordId) => ({
-                discordId: String(discordId),
-                label: 'ENV Customer',
-            })),
+            customers: rows.filter(r => r.role === 'customer').map(r => ({
+                discordId: r.discordId,
+                label: r.label || 'Customer'
+            }))
         };
-        lastAccessFetchSource = 'ENV ids';
-        console.log('[access] Loaded from ENV');
+        lastAccessFetchSource = 'SQLite DB';
+        console.log(`[access] Loaded ${rows.length} users from SQLite`);
         return true;
+    } catch (e) {
+        console.error('[access] SQLite fetch failed:', e.message);
+        return false;
     }
-
-    // 3. Try Loading from External access.json URLs (GitHub/Vercel)
-    for (const url of ACCESS_JSON_URL_CANDIDATES) {
-        try {
-            const res = await fetch(url, { cache: 'no-store' });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            if (!data || typeof data !== 'object' || !Array.isArray(data.admins)) {
-                throw new Error('invalid access.json shape');
-            }
-            accessConfig = {
-                admins: data.admins || [],
-                customers: Array.isArray(data.customers) ? data.customers : [],
-            };
-            lastAccessFetchSource = url;
-            console.log('[access] Loaded from', url);
-            return true;
-        } catch (e) {
-            console.warn('[access] Failed to fetch', url, '—', e.message || e);
-        }
-    }
-
-    accessConfig = { admins: [], customers: [] };
-    return false;
 }
 
 function findAdmin(discordId) {
@@ -269,10 +222,14 @@ app.post('/api/access/sync-github', async (req, res) => {
 
     const ok = await syncAccessToGitHub(accessConfig);
     if (ok) {
-        res.json({ success: true, message: 'Successfully synced SQLite database to GitHub access.json' });
+        res.json({ success: true, message: 'Successfully synced SQLite database to GitHub' });
     } else {
         res.status(500).json({ success: false, message: 'GitHub sync failed. Check server logs.' });
     }
+});
+
+app.get('/api/access/roster', async (req, res) => {
+    res.json({ success: true, admins: accessConfig.admins, customers: accessConfig.customers });
 });
 
 // 1. PIN SYSTEM
