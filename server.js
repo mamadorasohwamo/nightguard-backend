@@ -78,17 +78,13 @@ app.post('/api/auth/discord', async (req, res) => {
 
 // 2. PIN System
 app.post('/api/pin/generate', authenticateToken, (req, res) => {
-    // Check if customer exists in storage to be safe
-    const customer = storage.customers.find(c => c.id === req.user.id);
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
-
     const pin = `NG-${Math.random().toString(36).substring(2, 6).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
     const newPin = {
         id: storage.generated_pins.length + 1,
         pin,
-        customer_id: customer.id,
+        customer_id: req.user.id,
         created_at: new Date().toISOString(),
         expires_at: expiresAt.toISOString()
     };
