@@ -311,16 +311,22 @@ app.get('/api/logs', async (req, res) => {
     if (!viewer) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
     let list = scanSessions;
-    
-    // If not a full admin, only show logs where this user is the owner of the PIN
-    if (!await hasFullPermission(viewer)) {
-        list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(viewer));
+    const isFullAdmin = await hasFullPermission(viewer);
+    const mode = req.query.mode; // 'all' for admin global view
+
+    if (mode === 'all' && isFullAdmin) {
+        // Show everything for Admins in Global Mode
+        list = scanSessions;
     } else {
-        // Admin view: optionally filter by target customer if provided
-        const targetCustomer = req.query.targetCustomer;
-        if (targetCustomer) {
-            list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(targetCustomer));
-        }
+        // Default: Only show logs where this user is the owner of the PIN
+        // This applies to both Customers AND Admins for their personal history
+        list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(viewer));
+    }
+
+    // Special case: Admin viewing a specific customer
+    const targetCustomer = req.query.targetCustomer;
+    if (targetCustomer && isFullAdmin) {
+        list = scanSessions.filter((s) => String(s.pinOwnerDiscordId) === String(targetCustomer));
     }
     
     res.json({ success: true, logs: list });
@@ -437,15 +443,17 @@ app.get('/api/admin/customer-stats', async (req, res) => {
         if (!customerMap.has(ownerId)) {
             customerMap.set(ownerId, { 
                 discordId: ownerId, 
-                scanCount: 0, 
-                detections: 0,
-                lastActive: s.scanTime 
+                totalScans: 0, 
+                totalDetections: 0,
+                riskScoreSum: 0,
+                latestScan: s.scanTime 
             });
         }
         const stats = customerMap.get(ownerId);
-        stats.scanCount++;
-        if (s.detections && s.detections.length > 0) stats.detections++;
-        if (new Date(s.scanTime) > new Date(stats.lastActive)) stats.lastActive = s.scanTime;
+        stats.totalScans++;
+        stats.totalDetections += (s.detections ? s.detections.length : 0);
+        stats.riskScoreSum += (s.riskLevel || 0);
+        if (new Date(s.scanTime) > new Date(stats.latestScan)) stats.latestScan = s.scanTime;
     });
 
     res.json({ success: true, customers: Array.from(customerMap.values()) });
