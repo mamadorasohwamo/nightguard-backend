@@ -53,7 +53,10 @@ let systemSettings = {
 
 async function syncAccessToGitHub(newConfig) {
     if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-        console.warn('[github] Missing credentials for sync. Token:', !!GITHUB_TOKEN, 'Owner:', GITHUB_OWNER, 'Repo:', GITHUB_REPO);
+        console.error('[github] CRITICAL: Missing configuration!');
+        console.error(`[github] Token Present: ${!!GITHUB_TOKEN}`);
+        console.error(`[github] Owner: ${GITHUB_OWNER}`);
+        console.error(`[github] Repo: ${GITHUB_REPO}`);
         return false;
     }
 
@@ -61,9 +64,9 @@ async function syncAccessToGitHub(newConfig) {
         const filePath = 'public/access.json';
         const newContent = JSON.stringify(newConfig, null, 4);
 
-        console.log(`[github] Attempting to sync access.json to ${GITHUB_OWNER}/${GITHUB_REPO}...`);
+        console.log(`[github] Starting sync for ${GITHUB_OWNER}/${GITHUB_REPO}/${filePath}...`);
 
-        // 1. Get file SHA
+        // 1. Get file SHA (Required for updates)
         let sha;
         try {
             const { data } = await octokit.repos.getContent({
@@ -72,33 +75,35 @@ async function syncAccessToGitHub(newConfig) {
                 path: filePath
             });
             sha = data.sha;
-            console.log('[github] Found existing access.json SHA:', sha);
+            console.log('[github] Successfully retrieved current file SHA:', sha);
         } catch (e) {
             if (e.status === 404) {
-                console.warn('[github] access.json not found, will create new file');
+                console.warn('[github] access.json not found on GitHub. A new file will be created.');
             } else {
-                console.error('[github] Failed to fetch content info:', e.message, 'Status:', e.status);
-                throw e; // Rethrow to trigger main catch
+                console.error('[github] Error fetching file info:', e.message, 'Status:', e.status);
+                throw e; 
             }
         }
 
-        // 2. Update file on GitHub
+        // 2. Push update to GitHub
         const updateResponse = await octokit.repos.createOrUpdateFileContents({
             owner: GITHUB_OWNER,
             repo: GITHUB_REPO,
             path: filePath,
-            message: `chore: dynamically updated access.json from admin dashboard at ${new Date().toISOString()}`,
+            message: `chore: dashboard update - ${new Date().toLocaleString()}`,
             content: Buffer.from(newContent).toString('base64'),
-            sha
+            sha // If sha is undefined, GitHub creates the file. If defined, it updates.
         });
 
-        console.log('[github] access.json successfully synced to GitHub. Commit:', updateResponse.data.commit.sha);
+        console.log('[github] Sync COMPLETED. New Commit SHA:', updateResponse.data.commit.sha);
         return true;
     } catch (e) {
-        console.error('[github] Sync failed CRITICAL:', e.message);
-        if (e.status === 401) console.error('[github] ERROR: Invalid GitHub Token (401 Unauthorized)');
-        if (e.status === 403) console.error('[github] ERROR: Permission denied or Rate limit (403 Forbidden)');
-        if (e.status === 404) console.error('[github] ERROR: Repository or File path not found (404 Not Found)');
+        console.error('[github] SYNC FAILED!');
+        console.error('[github] Error Message:', e.message);
+        if (e.response) {
+            console.error('[github] GitHub API Response Data:', JSON.stringify(e.response.data, null, 2));
+            console.error('[github] HTTP Status:', e.response.status);
+        }
         return false;
     }
 }
@@ -551,37 +556,10 @@ async function handleManageAccess(req, res) {
     }
 }
 
-/** @deprecated — adds to admins list only */
+/** @deprecated — use /api/access/manage */
 app.post('/api/admin/manage', async (req, res) => {
     req.body = { ...(req.body || {}), role: 'admin' };
-    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
-    if (!await hasFullPermission(viewer)) {
-        return res.status(403).json({ success: false, error: 'forbidden' });
-    }
-    const { action, discordId, permissions, label } = req.body || {};
-    if (!discordId) return res.status(400).json({ success: false, error: 'discordId required' });
-    const id = String(discordId);
-    let admins = [...(accessConfig.admins || [])];
-    let customers = (accessConfig.customers || []).filter((c) => String(c.discordId) !== id);
-    const idx = admins.findIndex((a) => String(a.discordId) === id);
-    if (action === 'remove') {
-        if (idx >= 0) admins.splice(idx, 1);
-    } else if (action === 'add' || action === 'give') {
-        const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
-        const entry = { discordId: id, permissions: perms, label: label || 'NightGuard Admin' };
-        if (idx >= 0) admins[idx] = { ...admins[idx], ...entry };
-        else admins.push(entry);
-    } else {
-        return res.status(400).json({ success: false, error: 'action must be add or remove' });
-    }
-    accessConfig.admins = admins;
-    accessConfig.customers = customers;
-    res.json({
-        success: true,
-        admins: accessConfig.admins,
-        customers: accessConfig.customers,
-        note: 'Applied in-memory. Commit access.json and redeploy Vercel.',
-    });
+    return handleManageAccess(req, res);
 });
 
 // 6. Bot — rotate access.json
