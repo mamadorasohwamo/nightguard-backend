@@ -53,13 +53,15 @@ let systemSettings = {
 
 async function syncAccessToGitHub(newConfig) {
     if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-        console.warn('[github] Missing credentials for sync');
+        console.warn('[github] Missing credentials for sync. Token:', !!GITHUB_TOKEN, 'Owner:', GITHUB_OWNER, 'Repo:', GITHUB_REPO);
         return false;
     }
 
     try {
         const filePath = 'public/access.json';
         const newContent = JSON.stringify(newConfig, null, 4);
+
+        console.log(`[github] Attempting to sync access.json to ${GITHUB_OWNER}/${GITHUB_REPO}...`);
 
         // 1. Get file SHA
         let sha;
@@ -70,24 +72,33 @@ async function syncAccessToGitHub(newConfig) {
                 path: filePath
             });
             sha = data.sha;
+            console.log('[github] Found existing access.json SHA:', sha);
         } catch (e) {
-            console.warn('[github] access.json not found, creating new');
+            if (e.status === 404) {
+                console.warn('[github] access.json not found, will create new file');
+            } else {
+                console.error('[github] Failed to fetch content info:', e.message, 'Status:', e.status);
+                throw e; // Rethrow to trigger main catch
+            }
         }
 
         // 2. Update file on GitHub
-        await octokit.repos.createOrUpdateFileContents({
+        const updateResponse = await octokit.repos.createOrUpdateFileContents({
             owner: GITHUB_OWNER,
             repo: GITHUB_REPO,
             path: filePath,
-            message: 'chore: dynamically updated access.json from admin dashboard',
+            message: `chore: dynamically updated access.json from admin dashboard at ${new Date().toISOString()}`,
             content: Buffer.from(newContent).toString('base64'),
             sha
         });
 
-        console.log('[github] access.json successfully synced to GitHub');
+        console.log('[github] access.json successfully synced to GitHub. Commit:', updateResponse.data.commit.sha);
         return true;
     } catch (e) {
-        console.error('[github] Sync failed:', e.message);
+        console.error('[github] Sync failed CRITICAL:', e.message);
+        if (e.status === 401) console.error('[github] ERROR: Invalid GitHub Token (401 Unauthorized)');
+        if (e.status === 403) console.error('[github] ERROR: Permission denied or Rate limit (403 Forbidden)');
+        if (e.status === 404) console.error('[github] ERROR: Repository or File path not found (404 Not Found)');
         return false;
     }
 }
