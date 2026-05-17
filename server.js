@@ -1,16 +1,39 @@
 /**
- * NightGuard AC Backend API v4
- * Forensic log isolation, access.json roles (admin + customer), PIN ownership.
+ * NightGuard AC Backend API v5
+ * Database authorization (MongoDB), GitHub sync, forensic log isolation.
  */
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const mongoose = require('mongoose');
+const { Octokit } = require('@octokit/rest');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/** access.json URLs — admins + customers */
+// --- Database Configuration ---
+const MONGODB_URI = process.env.MONGODB_URI;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = process.env.GITHUB_REPO_OWNER;
+const GITHUB_REPO = process.env.GITHUB_REPO_NAME;
+
+const userSchema = new mongoose.Schema({
+    discordId: { type: String, required: true, unique: true },
+    username: String,
+    label: String,
+    role: { type: String, enum: ['admin', 'customer'], default: 'customer' },
+    permissions: [String],
+    added_at: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// --- GitHub Octokit Configuration ---
+const octokit = new Octokit({ auth: GITHUB_TOKEN });
+
+/** access.json URLs — fallback admins + customers */
 const ACCESS_JSON_URL_CANDIDATES = [
     process.env.ACCESS_JSON_URL,
     process.env.ADMIN_JSON_URL,
@@ -41,7 +64,85 @@ let systemSettings = {
     pinExpiryMinutes: 60
 };
 
+async function syncAccessToGitHub() {
+    if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
+        console.warn('[github] Missing credentials for sync');
+        return;
+    }
+
+    try {
+        const filePath = 'public/access.json';
+        
+        // 1. Fetch latest users from DB
+        const allUsers = await User.find({});
+        const admins = allUsers.filter(u => u.role === 'admin').map(u => ({
+            discordId: u.discordId,
+            permissions: u.permissions || ['full'],
+            label: u.label || u.username || 'Admin'
+        }));
+        const customers = allUsers.filter(u => u.role === 'customer').map(u => ({
+            discordId: u.discordId,
+            label: u.label || u.username || 'Customer'
+        }));
+
+        const newContent = JSON.stringify({ admins, customers }, null, 4);
+
+        // 2. Get file SHA
+        let sha;
+        try {
+            const { data } = await octokit.repos.getContent({
+                owner: GITHUB_OWNER,
+                repo: GITHUB_REPO,
+                path: filePath
+            });
+            sha = data.sha;
+        } catch (e) {
+            console.warn('[github] access.json not found, creating new');
+        }
+
+        // 3. Update file
+        await octokit.repos.createOrUpdateFileContents({
+            owner: GITHUB_OWNER,
+            repo: GITHUB_REPO,
+            path: filePath,
+            message: 'chore: dynamically updated access.json from admin dashboard',
+            content: Buffer.from(newContent).toString('base64'),
+            sha
+        });
+
+        console.log('[github] access.json successfully synced to GitHub');
+    } catch (e) {
+        console.error('[github] Sync failed:', e.message);
+    }
+}
+
 async function fetchAccess() {
+    // 1. Try Loading from Database (Primary)
+    try {
+        if (mongoose.connection.readyState === 1) {
+            const dbUsers = await User.find({});
+            if (dbUsers.length > 0) {
+                accessConfig = {
+                    admins: dbUsers.filter(u => u.role === 'admin').map(u => ({
+                        discordId: u.discordId,
+                        permissions: u.permissions,
+                        label: u.label
+                    })),
+                    customers: dbUsers.filter(u => u.role === 'customer').map(u => ({
+                        discordId: u.discordId,
+                        label: u.label
+                    }))
+                };
+                lastAccessFetchSource = 'MongoDB';
+                console.log(`[access] MongoDB — ${accessConfig.admins.length} admins, ${accessConfig.customers.length} customers`);
+                return true;
+            }
+        }
+    } catch (e) {
+        console.warn('[access] DB Fetch failed, falling back:', e.message);
+    }
+
+    // 2. Try Loading from ENV (Secondary)
     const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
         .split(',')
         .map((s) => s.trim())
@@ -74,6 +175,7 @@ async function fetchAccess() {
         return true;
     }
 
+    // 3. Try Loading from External access.json URLs (Fallback)
     for (const url of ACCESS_JSON_URL_CANDIDATES) {
         try {
             const res = await fetch(url, { cache: 'no-store' });
@@ -103,7 +205,7 @@ async function fetchAccess() {
 
     accessConfig = { admins: [], customers: [] };
     console.error(
-        '[access] CRITICAL: No access list loaded. Deploy nightguard-web/public/access.json or set env IDs.'
+        '[access] CRITICAL: No access list loaded. Set MONGODB_URI or env IDs.'
     );
     return false;
 }
@@ -429,59 +531,65 @@ app.get('/api/admin/admins', (req, res) => {
 });
 
 // 5. Web dashboard — add/remove admin or customer (full permission)
+app.post('/api/access/add', async (req, res) => {
+    req.body.action = 'add';
+    return handleManageAccess(req, res);
+});
+
 app.post('/api/access/manage', (req, res) => {
+    return handleManageAccess(req, res);
+});
+
+async function handleManageAccess(req, res) {
     const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
     if (!hasFullPermission(viewer)) {
         return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
-    const { action, discordId, role, permissions, label } = req.body || {};
+    const { action, discordId, role, permissions, label, username } = req.body || {};
     if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
         return res.status(400).json({ success: false, error: 'invalid_discord_id' });
     }
-    const listRole = role === 'customer' ? 'customer' : 'admin';
     const id = String(discordId);
+    const targetRole = role === 'customer' ? 'customer' : 'admin';
 
-    let admins = [...(accessConfig.admins || [])];
-    let customers = [...(accessConfig.customers || [])];
-
-    const removeFromBoth = () => {
-        const ai = admins.findIndex((a) => String(a.discordId) === id);
-        if (ai >= 0) admins.splice(ai, 1);
-        const ci = customers.findIndex((c) => String(c.discordId) === id);
-        if (ci >= 0) customers.splice(ci, 1);
-    };
-
-    if (action === 'remove') {
-        removeFromBoth();
-    } else if (action === 'add' || action === 'give') {
-        removeFromBoth();
-        if (listRole === 'customer') {
-            customers.push({
-                discordId: id,
-                label: label || 'NightGuard Customer',
-            });
-        } else {
+    try {
+        if (action === 'remove') {
+            await User.deleteOne({ discordId: id });
+            console.log(`[access] Removed ${id} from DB`);
+        } else if (action === 'add' || action === 'give') {
             const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
-            admins.push({
-                discordId: id,
-                permissions: perms,
-                label: label || 'NightGuard Admin',
-            });
+            await User.findOneAndUpdate(
+                { discordId: id },
+                { 
+                    discordId: id,
+                    role: targetRole,
+                    permissions: targetRole === 'admin' ? perms : [],
+                    label: label || (targetRole === 'admin' ? 'NightGuard Admin' : 'NightGuard Customer'),
+                    username: username || ''
+                },
+                { upsert: true, new: true }
+            );
+            console.log(`[access] Added/Updated ${id} as ${targetRole} in DB`);
+        } else {
+            return res.status(400).json({ success: false, error: 'action must be add or remove' });
         }
-    } else {
-        return res.status(400).json({ success: false, error: 'action must be add or remove' });
-    }
 
-    accessConfig.admins = admins;
-    accessConfig.customers = customers;
-    res.json({
-        success: true,
-        admins: accessConfig.admins,
-        customers: accessConfig.customers,
-        note: 'Applied in-memory. Commit nightguard-web/public/access.json and redeploy Vercel to persist.',
-    });
-});
+        // Refresh local config and sync to GitHub
+        await fetchAccess();
+        await syncAccessToGitHub();
+
+        res.json({
+            success: true,
+            admins: accessConfig.admins,
+            customers: accessConfig.customers,
+            note: 'Successfully updated database and synced to GitHub.',
+        });
+    } catch (e) {
+        console.error('[access] Manage failed:', e.message);
+        res.status(500).json({ success: false, error: 'database_error', message: e.message });
+    }
+}
 
 /** @deprecated — adds to admins list only */
 app.post('/api/admin/manage', (req, res) => {
@@ -562,6 +670,18 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 async function boot() {
+    // 1. Connect to MongoDB
+    if (MONGODB_URI) {
+        try {
+            await mongoose.connect(MONGODB_URI);
+            console.log('[db] Connected to MongoDB');
+        } catch (e) {
+            console.error('[db] Connection failed:', e.message);
+        }
+    } else {
+        console.warn('[db] MONGODB_URI not set, using fallback access modes');
+    }
+
     await fetchAccess();
 
     const refreshRaw = process.env.ACCESS_JSON_REFRESH_MS || process.env.ADMIN_JSON_REFRESH_MS;
@@ -576,12 +696,12 @@ async function boot() {
 
     app.listen(PORT, () => {
         console.log(`=========================================`);
-        console.log(`NightGuard AC Backend v4 - Online`);
+        console.log(`NightGuard AC Backend v5 - Online`);
         console.log(`Port: ${PORT}`);
-        console.log(`Access URLs: ${ACCESS_JSON_URL_CANDIDATES.join(' -> ')}`);
+        console.log(`Access Mode: ${lastAccessFetchSource}`);
         console.log(
             `Loaded: ${(accessConfig.admins || []).length} admin(s), ` +
-            `${(accessConfig.customers || []).length} customer(s) (${lastAccessFetchSource})`
+            `${(accessConfig.customers || []).length} customer(s)`
         );
         console.log(`=========================================`);
     });
