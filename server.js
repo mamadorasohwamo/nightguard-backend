@@ -26,6 +26,21 @@ db.serialize(() => {
         added_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    db.run(`CREATE TABLE IF NOT EXISTS scans (
+        sessionId TEXT PRIMARY KEY,
+        pin TEXT,
+        pinOwnerDiscordId TEXT,
+        discordId TEXT,
+        discordUsername TEXT,
+        discordAvatar TEXT,
+        pcName TEXT,
+        hwid TEXT,
+        scanTime DATETIME,
+        riskLevel INTEGER,
+        status TEXT,
+        fullData TEXT
+    )`);
+
     // Add permanent admin
     const adminId = '876582559876796427';
     db.run(`INSERT OR IGNORE INTO users (discordId, role, label, permissions) 
@@ -353,12 +368,18 @@ app.delete('/api/logs/:id', async (req, res) => {
     if (!await canDeleteSession(viewer, session)) {
         return res.status(403).json({ success: false, message: 'Forbidden' });
     }
-    scanSessions = scanSessions.filter((s) => s.sessionId !== req.params.id);
-    console.log(`[DELETE] Session ${req.params.id} removed (by ${viewer}).`);
-    res.json({ success: true, message: 'Session deleted' });
+    
+    try {
+        await dbRun("DELETE FROM scans WHERE sessionId = ?", [req.params.id]);
+        scanSessions = scanSessions.filter((s) => s.sessionId !== req.params.id);
+        console.log(`[DELETE] Session ${req.params.id} removed (by ${viewer}).`);
+        res.json({ success: true, message: 'Session deleted' });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Delete failed' });
+    }
 });
 
-app.post('/api/scan/result', (req, res) => {
+app.post('/api/scan/result', async (req, res) => {
     const data = req.body || {};
     const pin = data.pin || '';
     const ownerFromPin = pinOwners.get(pin) || data.pinOwnerDiscordId || null;
@@ -369,9 +390,10 @@ app.post('/api/scan/result', (req, res) => {
         pinOwnerDiscordId: ownerFromPin || 'unknown',
         discordId: data.discordId || 'N/A',
         discordUsername: data.discordUsername || 'Guest',
+        discordAvatar: data.discordAvatar || '',
         pcName: data.pcName || 'Unknown PC',
         hwid: data.hwid || 'N/A',
-        scanTime: new Date(),
+        scanTime: new Date().toISOString(),
         riskLevel: data.riskLevel || 0,
         detections: data.detections || [],
         browserFindings: data.browserFindings || [],
@@ -406,13 +428,33 @@ app.post('/api/scan/result', (req, res) => {
         status: (data.riskLevel > 50) ? 'FLAGGED' : 'SECURE'
     };
 
-    scanSessions.unshift(newSession);
-    if (scanSessions.length > 1000) scanSessions.pop();
+    try {
+        await dbRun(`INSERT INTO scans (sessionId, pin, pinOwnerDiscordId, discordId, discordUsername, discordAvatar, pcName, hwid, scanTime, riskLevel, status, fullData) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                     [
+                         newSession.sessionId, 
+                         newSession.pin, 
+                         newSession.pinOwnerDiscordId, 
+                         newSession.discordId, 
+                         newSession.discordUsername, 
+                         newSession.discordAvatar,
+                         newSession.pcName, 
+                         newSession.hwid, 
+                         newSession.scanTime, 
+                         newSession.riskLevel, 
+                         newSession.status, 
+                         JSON.stringify(newSession)
+                     ]);
+        
+        scanSessions.unshift(newSession);
+        if (scanSessions.length > 1000) scanSessions.pop();
 
-    console.log(
-        `[SCAN] ${newSession.pcName} risk=${newSession.riskLevel}% owner=${newSession.pinOwnerDiscordId}`
-    );
-    res.json({ success: true, sessionId: newSession.sessionId });
+        console.log(`[SCAN] ${newSession.pcName} risk=${newSession.riskLevel}% owner=${newSession.pinOwnerDiscordId}`);
+        res.json({ success: true, sessionId: newSession.sessionId });
+    } catch (e) {
+        console.error('[scan] Save failed:', e.message);
+        res.status(500).json({ success: false, message: 'Failed to save scan result' });
+    }
 });
 
 // 3. STATS & SETTINGS
@@ -443,6 +485,8 @@ app.get('/api/admin/customer-stats', async (req, res) => {
         if (!customerMap.has(ownerId)) {
             customerMap.set(ownerId, { 
                 discordId: ownerId, 
+                discordUsername: s.discordUsername || 'Unknown',
+                discordAvatar: s.discordAvatar || '',
                 totalScans: 0, 
                 totalDetections: 0,
                 riskScoreSum: 0,
@@ -453,7 +497,11 @@ app.get('/api/admin/customer-stats', async (req, res) => {
         stats.totalScans++;
         stats.totalDetections += (s.detections ? s.detections.length : 0);
         stats.riskScoreSum += (s.riskLevel || 0);
-        if (new Date(s.scanTime) > new Date(stats.latestScan)) stats.latestScan = s.scanTime;
+        if (new Date(s.scanTime) > new Date(stats.latestScan)) {
+            stats.latestScan = s.scanTime;
+            if (s.discordUsername) stats.discordUsername = s.discordUsername;
+            if (s.discordAvatar) stats.discordAvatar = s.discordAvatar;
+        }
     });
 
     res.json({ success: true, customers: Array.from(customerMap.values()) });
@@ -636,8 +684,21 @@ setInterval(() => {
     activePins = activePins.filter((p) => p.expiresAt > now || !p.used);
 }, 10 * 60 * 1000);
 
+async function fetchScans() {
+    try {
+        const rows = await dbAll("SELECT fullData FROM scans ORDER BY scanTime DESC LIMIT 1000", []);
+        scanSessions = rows.map(r => JSON.parse(r.fullData));
+        console.log(`[scans] Loaded ${scanSessions.length} scans from SQLite`);
+        return true;
+    } catch (e) {
+        console.error('[scans] SQLite fetch failed:', e.message);
+        return false;
+    }
+}
+
 async function boot() {
     await fetchAccess();
+    await fetchScans();
 
     const refreshRaw = process.env.ACCESS_JSON_REFRESH_MS || process.env.ADMIN_JSON_REFRESH_MS;
     const refreshMs = refreshRaw ? parseInt(refreshRaw, 10) : 900000;
