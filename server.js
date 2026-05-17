@@ -1,289 +1,485 @@
 /**
- * NightGuard AC Backend API v5 - Enterprise Grade (In-Memory Edition)
- * Multi-tenant isolation, JWT Auth, Role-based access.
- * NO DATABASE FILE REQUIRED.
+ * NightGuard AC Backend API v4
+ * Forensic log isolation, access.json roles (admin + customer), PIN ownership.
  */
 
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const JWT_SECRET = process.env.JWT_SECRET || 'nightguard_secret_key_2026';
 
-// --- IN-MEMORY STORAGE ---
-// Resets on server restart
-const storage = {
-    customers: [],      // { id, discord_id, username, avatar, role }
-    generated_pins: [], // { pin, customer_id, expires_at }
-    scans: [],          // { session_id, customer_id, pin_id, player_hwid, player_name, risk_score, verdict, raw_data, created_at }
-    detections: []      // { scan_id, category, path, matched_keyword, severity, confidence_score }
-};
+/** access.json URLs — admins + customers */
+const ACCESS_JSON_URL_CANDIDATES = [
+    process.env.ACCESS_JSON_URL,
+    process.env.ADMIN_JSON_URL,
+    'https://nightguardac.vercel.app/access.json',
+    'https://nightguardac.vercel.app/admin.json',
+    'https://nightguardac.netlify.app/access.json',
+].filter(Boolean);
+
+let lastAccessFetchSource = '(none)';
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '50mb' }));
 
-// Request Logging Middleware
-app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-    next();
-});
+let accessConfig = { admins: [], customers: [] };
+const pinOwners = new Map(); // pin string -> creator discord id
 
-// Auth Middleware
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    console.log(`[AUTH] Received header: ${authHeader}`);
+let activePins = [];
+let scanSessions = [];
+let systemSettings = {
+    realTimeScan: true,
+    browserMonitoring: true,
+    discordMonitoring: true,
+    archiveScanning: true,
+    dllScanning: true,
+    telemetry: true,
+    autoBan: false,
+    pinExpiryMinutes: 60
+};
 
-    const token = authHeader && authHeader.split(' ')[1];
+async function fetchAccess() {
+    const envAdmins = (process.env.ADMIN_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const envCustomers = (process.env.CUSTOMER_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
 
-    if (!token) {
-        console.log(`[AUTH] Missing token for ${req.url}`);
-        return res.status(401).json({ success: false, error: 'Authentication token required' });
+    if (envAdmins.length || envCustomers.length) {
+        accessConfig = {
+            admins: envAdmins.map((discordId) => ({
+                discordId: String(discordId),
+                permissions: ['full'],
+                label: 'ENV ADMIN',
+            })),
+            customers: envCustomers.map((discordId) => ({
+                discordId: String(discordId),
+                label: 'ENV Customer',
+            })),
+        };
+        lastAccessFetchSource = 'ENV ids';
+        console.log(
+            '[access] ENV —',
+            accessConfig.admins.length,
+            'admin(s),',
+            accessConfig.customers.length,
+            'customer(s)'
+        );
+        return true;
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            console.log(`[AUTH] JWT Verification failed: ${err.name} - ${err.message}`);
-            const errorMsg = err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token';
-            return res.status(403).json({ success: false, error: errorMsg });
+    for (const url of ACCESS_JSON_URL_CANDIDATES) {
+        try {
+            const res = await fetch(url, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (!data || typeof data !== 'object' || !Array.isArray(data.admins)) {
+                throw new Error('invalid access.json shape');
+            }
+            accessConfig = {
+                admins: data.admins || [],
+                customers: Array.isArray(data.customers) ? data.customers : [],
+            };
+            lastAccessFetchSource = url;
+            console.log(
+                '[access] Loaded —',
+                accessConfig.admins.length,
+                'admin(s),',
+                accessConfig.customers.length,
+                'customer(s) from',
+                url
+            );
+            return true;
+        } catch (e) {
+            console.warn('[access] Failed to fetch', url, '—', e.message || e);
         }
-        
-        console.log(`[AUTH] Valid token for user: ${user.username} (${user.role})`);
-        req.user = user;
-        next();
-    });
-};
-
-const isAdmin = (req, res, next) => {
-    if (req.user.role !== 'admin') {
-        console.log(`[AUTH] Admin access denied for user ${req.user.id}`);
-        return res.status(403).json({ success: false, error: 'Admin access required' });
     }
-    next();
-};
+
+    accessConfig = { admins: [], customers: [] };
+    console.error(
+        '[access] CRITICAL: No access list loaded. Deploy nightguard-web/public/access.json or set env IDs.'
+    );
+    return false;
+}
+
+function findAdmin(discordId) {
+    if (discordId == null || discordId === '') return null;
+    const id = String(discordId);
+    return (accessConfig.admins || []).find((a) => String(a.discordId) === id) || null;
+}
+
+function findCustomer(discordId) {
+    if (discordId == null || discordId === '') return null;
+    const id = String(discordId);
+    return (accessConfig.customers || []).find((c) => String(c.discordId) === id) || null;
+}
+
+function hasEnvAdmin(id) {
+    return (process.env.ADMIN_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .includes(String(id));
+}
+
+function hasEnvCustomer(id) {
+    return (process.env.CUSTOMER_DISCORD_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .includes(String(id));
+}
+
+/** Admin or customer — may generate PIN and use dashboard */
+function isRegisteredUser(discordId) {
+    if (hasEnvAdmin(discordId) || hasEnvCustomer(discordId)) return true;
+    return !!findAdmin(discordId) || !!findCustomer(discordId);
+}
+
+/** Legacy name — admin panel list */
+function isRegisteredAdmin(discordId) {
+    return isRegisteredUser(discordId);
+}
+
+function isCustomerOnly(discordId) {
+    if (hasEnvAdmin(discordId) || findAdmin(discordId)) return false;
+    return hasEnvCustomer(discordId) || !!findCustomer(discordId);
+}
+
+function hasFullPermission(discordId) {
+    if (hasEnvAdmin(discordId)) return true;
+    const a = findAdmin(discordId);
+    if (!a) return false;
+    return (a.permissions || []).includes('full');
+}
+
+function canViewSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
+    return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
+}
+
+function canDeleteSession(viewerId, session) {
+    if (hasFullPermission(viewerId)) return true;
+    if (!isRegisteredAdmin(viewerId)) return false;
+    return String(session.pinOwnerDiscordId || '') === String(viewerId || '');
+}
 
 // --- API ROUTES ---
 
-app.get('/', (req, res) => res.json({ status: 'online', message: 'NightGuard Enterprise API Online v5 (In-Memory)' }));
+app.get('/', (req, res) => res.send('NightGuard API Online v4'));
 
-// 0. Stats Route
+// 1. PIN SYSTEM
+app.post('/api/pin/generate', async (req, res) => {
+    try {
+        const discordId = req.body?.discordId || req.headers['x-discord-id'];
+        let authorized = isRegisteredUser(discordId);
+
+        if (!authorized && !(accessConfig.admins || []).length && !(accessConfig.customers || []).length) {
+            await fetchAccess();
+            authorized = isRegisteredUser(discordId);
+        }
+
+        if (!authorized) {
+            const knownIds = [
+                ...(accessConfig.admins || []).map((a) => String(a.discordId)),
+                ...(accessConfig.customers || []).map((c) => String(c.discordId)),
+            ];
+            return res.status(403).json({
+                success: false,
+                error: 'forbidden',
+                message: 'PIN generation requires an authorized admin or customer account',
+                hint:
+                    'Add your Discord ID to nightguard-web/public/access.json (admins or customers) ' +
+                    'and redeploy Vercel, or set ADMIN_DISCORD_IDS / CUSTOMER_DISCORD_IDS on Railway.',
+                yourDiscordId: discordId ? String(discordId) : null,
+                adminsLoaded: (accessConfig.admins || []).length,
+                customersLoaded: (accessConfig.customers || []).length,
+                accessListSource: lastAccessFetchSource,
+                registeredIds: knownIds,
+            });
+        }
+
+        const rawUuid = uuidv4();
+        const pin = `NG-${rawUuid.split('-')[0].toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+        activePins.push({
+            pin,
+            hwid: null,
+            ownerDiscordId: String(discordId),
+            createdAt: Date.now(),
+            expiresAt: Date.now() + systemSettings.pinExpiryMinutes * 60 * 1000,
+            used: false
+        });
+        pinOwners.set(pin, String(discordId));
+
+        console.log(`[PIN] Generated: ${pin} for admin ${discordId}`);
+        res.json({ success: true, pin, ownerDiscordId: String(discordId) });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Generation failed' });
+    }
+});
+
+app.post('/api/pin/validate', (req, res) => {
+    const { pin, hwid } = req.body;
+    const foundPin = activePins.find((p) => p.pin === pin);
+
+    if (!foundPin) return res.status(401).json({ success: false, error: 'invalid_pin' });
+    if (Date.now() > foundPin.expiresAt) return res.status(401).json({ success: false, error: 'expired_pin' });
+    if (foundPin.used) return res.status(403).json({ success: false, error: 'used_pin' });
+
+    if (!foundPin.hwid) {
+        foundPin.hwid = hwid;
+    } else if (foundPin.hwid !== hwid) {
+        return res.status(403).json({ success: false, error: 'hwid_mismatch' });
+    }
+
+    foundPin.used = true;
+    const owner = foundPin.ownerDiscordId || pinOwners.get(pin);
+    if (owner) pinOwners.set(pin, String(owner));
+
+    console.log(`[VERIFY] PIN ${pin} validated for HWID ${hwid} (owner ${owner || 'n/a'})`);
+    res.json({ success: true, status: 'verified' });
+});
+
+// 2. LOG SYSTEM
+app.get('/api/logs', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    let list = scanSessions;
+    if (!hasFullPermission(viewer)) {
+        list = scanSessions.filter((s) => canViewSession(viewer, s));
+    }
+    res.json({ success: true, logs: list });
+});
+
+app.get('/api/logs/:id', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    const session = scanSessions.find((s) => s.sessionId === req.params.id);
+    if (!session) {
+        return res.status(404).json({ success: false, message: 'Session not found' });
+    }
+    if (!canViewSession(viewer, session)) {
+        return res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+    res.json({ success: true, session });
+});
+
+app.delete('/api/logs/:id', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    const session = scanSessions.find((s) => s.sessionId === req.params.id);
+    if (!session) {
+        return res.status(404).json({ success: false, message: 'Session not found' });
+    }
+    if (!canDeleteSession(viewer, session)) {
+        return res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+    scanSessions = scanSessions.filter((s) => s.sessionId !== req.params.id);
+    console.log(`[DELETE] Session ${req.params.id} removed (by ${viewer}).`);
+    res.json({ success: true, message: 'Session deleted' });
+});
+
+app.post('/api/scan/result', (req, res) => {
+    const data = req.body || {};
+    const pin = data.pin || '';
+    const ownerFromPin = pinOwners.get(pin) || data.pinOwnerDiscordId || null;
+
+    const newSession = {
+        sessionId: uuidv4().slice(0, 12).toUpperCase(),
+        pin: pin || 'N/A',
+        pinOwnerDiscordId: ownerFromPin || 'unknown',
+        discordId: data.discordId || 'N/A',
+        discordUsername: data.discordUsername || 'Guest',
+        pcName: data.pcName || 'Unknown PC',
+        hwid: data.hwid || 'N/A',
+        scanTime: new Date(),
+        riskLevel: data.riskLevel || 0,
+        detections: data.detections || [],
+        browserFindings: data.browserFindings || [],
+        discordFindings: data.discordFindings || [],
+        discordUserIds: data.discordUserIds || [],
+        discordAccountRisk: data.discordAccountRisk || '',
+        discordAccounts: data.discordAccounts || [],
+        discordAuditReport: data.discordAuditReport || '',
+        mtaSerial: data.mtaSerial || '',
+        evasionReport: data.evasionReport || '',
+        sideLoadEvidence: data.sideLoadEvidence || [],
+        advancedForensicReport: data.advancedForensicReport || '',
+        dnsCacheHits: data.dnsCacheHits || [],
+        explorerMemoryHits: data.explorerMemoryHits || [],
+        injectionTraces: data.injectionTraces || [],
+        extendedForensicReport: data.extendedForensicReport || '',
+        usbForensicHits: data.usbForensicHits || [],
+        jumpListHits: data.jumpListHits || [],
+        deepForensicReport: data.deepForensicReport || '',
+        unsignedFilesCount: data.unsignedFilesCount || 0,
+        highEntropyCount: data.highEntropyCount || 0,
+        pcaForensicHits: data.pcaForensicHits || [],
+        entropyFindings: data.entropyFindings || [],
+        yaraFindings: data.yaraFindings || [],
+        unsignedFileFindings: data.unsignedFileFindings || [],
+        rpfIntegrityHits: data.rpfIntegrityHits || [],
+        suspiciousFiles: data.suspiciousFiles || [],
+        suspiciousDlls: data.suspiciousDlls || [],
+        suspiciousArchives: data.suspiciousArchives || [],
+        registryChanges: data.registryChanges || [],
+        status: (data.riskLevel > 50) ? 'FLAGGED' : 'SECURE'
+    };
+
+    scanSessions.unshift(newSession);
+    if (scanSessions.length > 1000) scanSessions.pop();
+
+    console.log(
+        `[SCAN] ${newSession.pcName} risk=${newSession.riskLevel}% owner=${newSession.pinOwnerDiscordId}`
+    );
+    res.json({ success: true, sessionId: newSession.sessionId });
+});
+
+// 3. STATS & SETTINGS
 app.get('/api/stats', (req, res) => {
-    const totalScans = storage.scans.length;
-    const totalUsers = storage.customers.length;
-    const criticalDetections = storage.detections.filter(d => d.severity === 'CRITICAL').length;
-    const flaggedScans = storage.scans.filter(s => s.risk_score > 50).length;
-    const activePins = storage.generated_pins.filter(p => new Date(p.expires_at) > new Date()).length;
-
     res.json({
         success: true,
         stats: {
-            totalScans,
-            flaggedScans,
-            uniqueUsers: totalUsers,
-            activePins,
-            criticalDetections,
-            onlineUsers: totalUsers // Placeholder
+            totalScans: scanSessions.length,
+            flaggedScans: scanSessions.filter((s) => s.status === 'FLAGGED').length,
+            uniqueUsers: new Set(scanSessions.map((s) => s.hwid)).size,
+            activePins: activePins.filter((p) => !p.used && p.expiresAt > Date.now()).length,
+            uptime: process.uptime()
         }
     });
 });
 
-// 1. Authentication (Discord OAuth2 placeholder)
-app.post('/api/auth/discord', async (req, res) => {
-    const { discordId, username, avatar } = req.body;
-    
-    let user = storage.customers.find(c => c.discord_id === discordId);
-    
-    if (!user) {
-        user = {
-            id: storage.customers.length + 1,
-            discord_id: discordId,
-            username: username,
-            avatar: avatar,
-            role: (storage.customers.length === 0) ? 'admin' : 'customer' // First user is admin
-        };
-        storage.customers.push(user);
+app.get('/api/settings', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    res.json(systemSettings);
+});
+
+app.post('/api/settings', (req, res) => {
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    const { viewerDiscordId, ...rest } = req.body || {};
+    systemSettings = { ...systemSettings, ...rest };
+    res.json({ success: true, settings: systemSettings });
+});
+
+// 4. Access roster — full admins only (admins + customers lists)
+app.get('/api/access/roster', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden', message: 'Admins only' });
+    }
+    res.json({
+        success: true,
+        admins: accessConfig.admins || [],
+        customers: accessConfig.customers || [],
+    });
+});
+
+/** @deprecated use /api/access/roster */
+app.get('/api/admin/admins', (req, res) => {
+    const viewer = req.query.viewerDiscordId || req.headers['x-discord-id'];
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    res.json({ success: true, admins: accessConfig.admins || [] });
+});
+
+// 5. Web dashboard — add/remove admin or customer (full permission)
+app.post('/api/access/manage', (req, res) => {
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden', message: 'Full admin permission required' });
     }
 
-    const token = jwt.sign({ 
-        id: user.id, 
-        discordId: user.discord_id, 
-        username: user.username, 
-        role: user.role 
-    }, JWT_SECRET, { expiresIn: '7d' });
+    const { action, discordId, role, permissions, label } = req.body || {};
+    if (!discordId || !/^\d{17,20}$/.test(String(discordId))) {
+        return res.status(400).json({ success: false, error: 'invalid_discord_id' });
+    }
+    const listRole = role === 'customer' ? 'customer' : 'admin';
+    const id = String(discordId);
 
-    console.log(`[AUTH] Generated 7d token for ${username}`);
-    res.json({ token, user: { id: user.id, discordId: user.discord_id, username: user.username, role: user.role } });
-});
+    let admins = [...(accessConfig.admins || [])];
+    let customers = [...(accessConfig.customers || [])];
 
-// 2. PIN System
-app.post('/api/pin/generate', authenticateToken, (req, res) => {
-    const pin = `NG-${Math.random().toString(36).substring(2, 6).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
-    const newPin = {
-        id: storage.generated_pins.length + 1,
-        pin,
-        customer_id: req.user.id,
-        created_at: new Date().toISOString(),
-        expires_at: expiresAt.toISOString()
+    const removeFromBoth = () => {
+        const ai = admins.findIndex((a) => String(a.discordId) === id);
+        if (ai >= 0) admins.splice(ai, 1);
+        const ci = customers.findIndex((c) => String(c.discordId) === id);
+        if (ci >= 0) customers.splice(ci, 1);
     };
-    
-    storage.generated_pins.push(newPin);
-    res.json({ success: true, pin, expiresAt });
-});
 
-// 3. Scan Upload (from Checker)
-app.post('/api/scan/upload', (req, res) => {
-    const { pin, hwid, playerName, riskScore, verdict, data } = req.body;
-
-    const pinRow = storage.generated_pins.find(p => p.pin === pin);
-    if (!pinRow) return res.status(400).json({ error: 'Invalid PIN' });
-
-    const sessionId = `NG-SESSION-${uuidv4().substring(0, 8).toUpperCase()}`;
-    const scanId = storage.scans.length + 1;
-    
-    const newScan = {
-        id: scanId,
-        session_id: sessionId,
-        customer_id: pinRow.customer_id,
-        pin_id: pinRow.id,
-        player_hwid: hwid,
-        player_name: playerName,
-        risk_score: riskScore,
-        verdict: verdict,
-        raw_data: JSON.stringify(data),
-        created_at: new Date().toISOString()
-    };
-    
-    storage.scans.push(newScan);
-
-    // Store detections if any
-    if (data.detections && Array.isArray(data.detections)) {
-        data.detections.forEach(det => {
-            storage.detections.push({
-                id: storage.detections.length + 1,
-                scan_id: scanId,
-                category: det.category,
-                path: det.path,
-                matched_keyword: det.match,
-                severity: det.severity,
-                confidence_score: det.confidenceScore || (det.score / 100.0)
+    if (action === 'remove') {
+        removeFromBoth();
+    } else if (action === 'add' || action === 'give') {
+        removeFromBoth();
+        if (listRole === 'customer') {
+            customers.push({
+                discordId: id,
+                label: label || 'NightGuard Customer',
             });
-        });
-    }
-
-    res.json({ success: true, sessionId });
-});
-
-// 4. Customer Dashboard (Isolated)
-app.get('/api/customer/scans', authenticateToken, (req, res) => {
-    const customerScans = storage.scans
-        .filter(s => s.customer_id === req.user.id)
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    res.json(customerScans);
-});
-
-// 4.1. Single Scan Details
-app.get('/api/scan/:sessionId', authenticateToken, (req, res) => {
-    const scan = storage.scans.find(s => s.session_id === req.params.sessionId);
-    if (!scan) return res.status(404).json({ success: false, error: 'Scan not found' });
-    
-    // Authorization: Must be owner or admin
-    if (scan.customer_id !== req.user.id && req.user.role !== 'admin') {
-        return res.status(403).json({ success: false, error: 'Access denied' });
-    }
-
-    const detections = storage.detections.filter(d => d.scan_id === scan.id);
-    res.json({ success: true, scan, detections });
-});
-
-// 4.2. Delete Scan
-app.delete('/api/scan/:sessionId', authenticateToken, (req, res) => {
-    const scanIndex = storage.scans.findIndex(s => s.session_id === req.params.sessionId);
-    if (scanIndex === -1) return res.status(404).json({ success: false, error: 'Scan not found' });
-    
-    const scan = storage.scans[scanIndex];
-    if (scan.customer_id !== req.user.id && req.user.role !== 'admin') {
-        return res.status(403).json({ success: false, error: 'Access denied' });
-    }
-
-    storage.scans.splice(scanIndex, 1);
-    res.json({ success: true, message: 'Scan deleted' });
-});
-
-// 5. Admin Dashboard (Global)
-app.get('/api/admin/inspection-logs', authenticateToken, isAdmin, (req, res) => {
-    const logs = storage.customers.map(c => {
-        const customerScans = storage.scans.filter(s => s.customer_id === c.id);
-        const latestScan = customerScans.length > 0 
-            ? customerScans.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0].created_at 
-            : null;
-
-        return {
-            id: c.id,
-            username: c.username,
-            avatar: c.avatar,
-            discord_id: c.discord_id,
-            total_scans: customerScans.length,
-            suspicious_scans: customerScans.filter(s => s.risk_score > 50).length,
-            critical_detections: customerScans.filter(s => s.risk_score > 80).length,
-            latest_scan_time: latestScan
-        };
-    });
-    res.json(logs);
-});
-
-app.get('/api/admin/customer/:id/scans', authenticateToken, isAdmin, (req, res) => {
-    const customerId = parseInt(req.params.id);
-    const customerScans = storage.scans
-        .filter(s => s.customer_id === customerId)
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    res.json(customerScans);
-});
-
-// 6. Access Management
-app.get('/api/access/roster', authenticateToken, isAdmin, (req, res) => {
-    res.json({ success: true, customers: storage.customers });
-});
-
-app.post('/api/access/manage', authenticateToken, isAdmin, (req, res) => {
-    const { action, discordId, role } = req.body;
-    
-    if (action === 'update_role') {
-        const user = storage.customers.find(c => c.discord_id === discordId);
-        if (user) {
-            user.role = role;
-            return res.json({ success: true, message: `Role updated to ${role}` });
+        } else {
+            const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+            admins.push({
+                discordId: id,
+                permissions: perms,
+                label: label || 'NightGuard Admin',
+            });
         }
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add or remove' });
     }
-    
-    res.status(400).json({ success: false, error: 'Invalid action or user not found' });
-});
 
-// --- ERROR HANDLING ---
-
-// Fallback for unknown API routes
-app.use('/api/*', (req, res) => {
-    console.log(`[404] Route not found: ${req.method} ${req.url}`);
-    res.status(404).json({
-        success: false,
-        error: 'API route not found'
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
+    res.json({
+        success: true,
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'Applied in-memory. Commit nightguard-web/public/access.json and redeploy Vercel to persist.',
     });
 });
 
-// Global Error Handler
-app.use((err, req, res, next) => {
-    console.error(`[ERROR] ${err.stack}`);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-        message: err.message
+/** @deprecated — adds to admins list only */
+app.post('/api/admin/manage', (req, res) => {
+    req.body = { ...(req.body || {}), role: 'admin' };
+    const viewer = req.headers['x-discord-id'] || req.body?.viewerDiscordId;
+    if (!hasFullPermission(viewer)) {
+        return res.status(403).json({ success: false, error: 'forbidden' });
+    }
+    const { action, discordId, permissions, label } = req.body || {};
+    if (!discordId) return res.status(400).json({ success: false, error: 'discordId required' });
+    const id = String(discordId);
+    let admins = [...(accessConfig.admins || [])];
+    let customers = (accessConfig.customers || []).filter((c) => String(c.discordId) !== id);
+    const idx = admins.findIndex((a) => String(a.discordId) === id);
+    if (action === 'remove') {
+        if (idx >= 0) admins.splice(idx, 1);
+    } else if (action === 'add' || action === 'give') {
+        const perms = Array.isArray(permissions) && permissions.length ? permissions : ['full'];
+        const entry = { discordId: id, permissions: perms, label: label || 'NightGuard Admin' };
+        if (idx >= 0) admins[idx] = { ...admins[idx], ...entry };
+        else admins.push(entry);
+    } else {
+        return res.status(400).json({ success: false, error: 'action must be add or remove' });
+    }
+    accessConfig.admins = admins;
+    accessConfig.customers = customers;
+    res.json({
+        success: true,
+        admins: accessConfig.admins,
+        customers: accessConfig.customers,
+        note: 'Applied in-memory. Commit access.json and redeploy Vercel to persist.',
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`NightGuard Enterprise API (In-Memory) listening on port ${PORT}`);
+    console.log(`NightGuard API (v4) listening on port ${PORT}`);
+    fetchAccess();
 });
