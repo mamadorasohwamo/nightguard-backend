@@ -35,6 +35,8 @@ app.use((req, res, next) => {
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
+    console.log(`[AUTH] Received header: ${authHeader}`);
+
     const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) {
@@ -44,9 +46,12 @@ const authenticateToken = (req, res, next) => {
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
-            console.log(`[AUTH] Invalid token for ${req.url}: ${err.message}`);
-            return res.status(403).json({ success: false, error: 'Invalid or expired token' });
+            console.log(`[AUTH] JWT Verification failed: ${err.name} - ${err.message}`);
+            const errorMsg = err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token';
+            return res.status(403).json({ success: false, error: errorMsg });
         }
+        
+        console.log(`[AUTH] Valid token for user: ${user.username} (${user.role})`);
         req.user = user;
         next();
     });
@@ -107,8 +112,9 @@ app.post('/api/auth/discord', async (req, res) => {
         discordId: user.discord_id, 
         username: user.username, 
         role: user.role 
-    }, JWT_SECRET);
+    }, JWT_SECRET, { expiresIn: '7d' });
 
+    console.log(`[AUTH] Generated 7d token for ${username}`);
     res.json({ token, user: { id: user.id, discordId: user.discord_id, username: user.username, role: user.role } });
 });
 
